@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: handshake
+    runtime: python
+    plan: free
+    rootDir: handshake
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 8080
+    healthCheckPath: /health

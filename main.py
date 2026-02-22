@@ -1,6 +1,7 @@
 from typing import Any
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
+from datetime import datetime
 
 from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
@@ -14,6 +15,14 @@ app = FastAPI(title="Backend Utilities API", version="1.0.0")
 RECEIVER_ADDRESS = "0xd9f3cab9a103f76ceebe70513ee6d2499b40a650"
 PRICE = "$0.01"
 NETWORK = "eip155:8453"  # Base Mainnet
+
+# Stats tracking
+api_stats = {
+    "total_requests": 0,
+    "requests_today": 0,
+    "last_request_time": None,
+    "current_date": datetime.now().strftime("%Y-%m-%d")
+}
 
 # Create facilitator client (testnet)
 facilitator = HTTPFacilitatorClient(
@@ -117,6 +126,26 @@ class TextResponse(BaseModel):
     line_count: int
     avg_word_length: float
 
+class StatsResponse(BaseModel):
+    total_requests: int
+    requests_today: int
+    last_request_time: str | None
+    current_date: str
+
+def update_stats():
+    """Update request statistics."""
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    
+    # Reset daily counter if date changed
+    if api_stats["current_date"] != today:
+        api_stats["requests_today"] = 0
+        api_stats["current_date"] = today
+    
+    api_stats["total_requests"] += 1
+    api_stats["requests_today"] += 1
+    api_stats["last_request_time"] = now.isoformat()
+
 # Free endpoints (no payment required)
 @app.get("/")
 async def root() -> dict[str, Any]:
@@ -140,9 +169,20 @@ async def root() -> dict[str, Any]:
 async def health() -> dict[str, str]:
     return {"status": "healthy"}
 
+@app.get("/stats", response_model=StatsResponse)
+async def stats() -> StatsResponse:
+    """Get API usage statistics."""
+    return StatsResponse(
+        total_requests=api_stats["total_requests"],
+        requests_today=api_stats["requests_today"],
+        last_request_time=api_stats["last_request_time"],
+        current_date=api_stats["current_date"]
+    )
+
 # Paid endpoints
 @app.post("/v1/validate/email", response_model=EmailResponse)
 async def validate_email(request: EmailRequest) -> EmailResponse:
+    update_stats()
     import re
     import socket
     
@@ -185,6 +225,7 @@ async def validate_email(request: EmailRequest) -> EmailResponse:
 
 @app.post("/v1/validate/url", response_model=UrlResponse)
 async def validate_url(request: UrlRequest) -> UrlResponse:
+    update_stats()
     import urllib.request
     import urllib.error
     from urllib.parse import urlparse
@@ -239,6 +280,7 @@ async def validate_url(request: UrlRequest) -> UrlResponse:
 
 @app.post("/v1/transform/csv-to-json", response_model=CsvResponse)
 async def csv_to_json(request: CsvRequest) -> CsvResponse:
+    update_stats()
     csv_text = request.csv
     has_headers = request.headers
     
@@ -279,6 +321,7 @@ async def csv_to_json(request: CsvRequest) -> CsvResponse:
 
 @app.post("/v1/analyze/text", response_model=TextResponse)
 async def analyze_text(request: TextRequest) -> TextResponse:
+    update_stats()
     text = request.text
     
     if not text:

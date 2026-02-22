@@ -13,11 +13,11 @@ app = FastAPI(title="Backend Utilities API", version="1.0.0")
 # Configuration
 RECEIVER_ADDRESS = "0xd9f3cab9a103f76ceebe70513ee6d2499b40a650"
 PRICE = "$0.01"
-NETWORK = "eip155:84532"  # Base Sepolia testnet
+NETWORK = "eip155:8453"  # Base Sepolia testnet
 
 # Create facilitator client (testnet)
 facilitator = HTTPFacilitatorClient(
-    FacilitatorConfig(url="https://x402.org/facilitator")
+    FacilitatorConfig(url="https://api.cdp.coinbase.com/platform/v2/x402")
 )
 
 # Create resource server and register EVM scheme

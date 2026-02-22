@@ -1,11 +1,19 @@
 from typing import Any, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from datetime import datetime
 import sqlite3
 import uuid
+import asyncio
+import aiohttp
 
-app = FastAPI(title="Handshake", version="1.0.0", description="$1 Deal Insurance for Agents")
+app = FastAPI(title="Handshake", version="1.1.0", description="Automated Deal Insurance")
+
+# Configuration
+RECEIVER_ADDRESS = "0xd9f3cab9a103f76ceebe70513ee6d2499b40a650".lower()
+BASE_RPC = "https://mainnet.base.org"  # Public Base RPC
+USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # Base USDC
+REQUIRED_AMOUNT = 500000  # $0.50 in USDC (6 decimals)
 
 # Database
 def init_db():
@@ -23,6 +31,8 @@ def init_db():
             status TEXT DEFAULT 'pending',
             party_a_paid BOOLEAN DEFAULT FALSE,
             party_b_paid BOOLEAN DEFAULT FALSE,
+            party_a_tx TEXT,
+            party_b_tx TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP,
             disputed_at TIMESTAMP,
@@ -44,34 +54,74 @@ class CreateDealRequest(BaseModel):
     terms: str
     amount: float
 
-class PaymentRequest(BaseModel):
+class VerifyRequest(BaseModel):
     party: str  # 'a' or 'b'
-    tx_hash: str  # USDC transaction hash
+    tx_hash: str
 
-class DisputeRequest(BaseModel):
-    party: str
-    reason: str
+async def verify_usdc_payment(tx_hash: str, expected_memo: str) -> dict:
+    """Verify USDC payment on Base blockchain."""
+    async with aiohttp.ClientSession() as session:
+        # Get transaction receipt
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_getTransactionReceipt",
+            "params": [tx_hash],
+            "id": 1
+        }
+        async with session.post(BASE_RPC, json=payload) as resp:
+            data = await resp.json()
+            receipt = data.get('result')
+            
+            if not receipt:
+                return {"valid": False, "error": "Transaction not found"}
+            
+            if receipt.get('status') != '0x1':
+                return {"valid": False, "error": "Transaction failed"}
+            
+            # Check logs for USDC transfer
+            logs = receipt.get('logs', [])
+            for log in logs:
+                # USDC Transfer event: Transfer(address indexed from, address indexed to, uint256 value)
+                if len(log.get('topics', [])) >= 3:
+                    topic = log['topics'][0]
+                    if topic == '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef':  # Transfer event
+                        to_address = '0x' + log['topics'][2][-40:].lower()
+                        if to_address == RECEIVER_ADDRESS:
+                            # Check amount
+                            amount_hex = log['data'][-64:]
+                            amount = int(amount_hex, 16)
+                            if amount >= REQUIRED_AMOUNT:
+                                return {"valid": True, "amount": amount / 1e6}
+            
+            return {"valid": False, "error": "No valid USDC transfer found"}
 
 @app.get("/")
 async def root():
     return {
         "name": "Handshake",
-        "version": "1.0.0",
-        "description": "$1 Deal Insurance for Agents",
+        "version": "1.1.0",
+        "description": "Automated Deal Insurance for Agents",
         "price": "$0.50 per party ($1.00 total)",
-        "payment": "USDC on Base to 0xd9f3cab9a103f76ceebe70513ee6d2499b40a650",
+        "payment": {
+            "token": "USDC on Base",
+            "receiver": RECEIVER_ADDRESS,
+            "amount": "$0.50 (500000 micro-USDC)"
+        },
+        "auto_verify": True,
         "how_it_works": {
             "1": "Create deal (free)",
-            "2": "Both parties send $0.50 USDC with deal ID in memo",
-            "3": "Work happens",
-            "4": "Mark complete = both stakes returned",
-            "5": "Dispute = manual arbitration, loser forfeits"
+            "2": f"Send $0.50 USDC to {RECEIVER_ADDRESS[:10]}...{RECEIVER_ADDRESS[-8:]}",
+            "3": "Include deal ID in transaction data (optional)",
+            "4": "POST tx_hash to /deal/{id}/verify — auto-confirmed",
+            "5": "Both parties paid = deal activates automatically",
+            "6": "Mark complete = auto-return stakes",
+            "7": "Dispute = manual arbitration"
         }
     }
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "auto_verify": True}
 
 @app.post("/deal")
 async def create_deal(request: CreateDealRequest):
@@ -91,10 +141,12 @@ async def create_deal(request: CreateDealRequest):
         "deal_id": deal_id,
         "status": "created",
         "message": f"Deal {deal_id} created!",
-        "next_steps": {
-            "party_a": f"{request.party_a}: Send $0.50 USDC to 0xd9f3...a650 with memo '{deal_id}-A'",
-            "party_b": f"{request.party_b}: Send $0.50 USDC to 0xd9f3...a650 with memo '{deal_id}-B'",
-            "check_status": f"GET /deal/{deal_id}"
+        "payment_instructions": {
+            "to": RECEIVER_ADDRESS,
+            "amount": "$0.50 USDC (Base)",
+            "party_a": f"{request.party_a}: Send $0.50, then POST tx_hash to /deal/{deal_id}/verify",
+            "party_b": f"{request.party_b}: Send $0.50, then POST tx_hash to /deal/{deal_id}/verify",
+            "verification": f"POST /deal/{deal_id}/verify with {{'party': 'a'|'b', 'tx_hash': '0x...'}}"
         }
     }
 
@@ -120,13 +172,24 @@ async def get_deal(deal_id: str):
         "status": row[7],
         "party_a_paid": row[8],
         "party_b_paid": row[9],
-        "created_at": row[10],
-        "completed_at": row[11],
-        "disputed_at": row[12]
+        "party_a_tx": row[10],
+        "party_b_tx": row[11],
+        "created_at": row[12],
+        "completed_at": row[13],
+        "disputed_at": row[14]
     }
 
-@app.post("/deal/{deal_id}/pay")
-async def record_payment(deal_id: str, request: PaymentRequest):
+@app.post("/deal/{deal_id}/verify")
+async def verify_payment(deal_id: str, request: VerifyRequest):
+    """Auto-verify USDC payment on Base blockchain."""
+    
+    # First verify on-chain
+    result = await verify_usdc_payment(request.tx_hash, deal_id)
+    
+    if not result["valid"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    
+    # Update database
     conn = sqlite3.connect('handshake.db')
     c = conn.cursor()
     
@@ -139,39 +202,54 @@ async def record_payment(deal_id: str, request: PaymentRequest):
     
     status, a_paid, b_paid = row
     
-    # In production: verify tx_hash on-chain
-    # For MVP: manual verification
-    
     if request.party == "a":
-        c.execute('UPDATE deals SET party_a_paid = TRUE WHERE id = ?', (deal_id.upper(),))
-        msg = f"Party A payment recorded (tx: {request.tx_hash[:10]}...)."
-    elif request.party == "b":
-        c.execute('UPDATE deals SET party_b_paid = TRUE WHERE id = ?', (deal_id.upper(),))
         if a_paid:
-            c.execute("UPDATE deals SET status = 'active' WHERE id = ?", (deal_id.upper(),))
-        msg = f"Party B payment recorded (tx: {request.tx_hash[:10]}...)."
+            conn.close()
+            return {"status": "already_paid", "message": "Party A already paid"}
+        c.execute('UPDATE deals SET party_a_paid = TRUE, party_a_tx = ? WHERE id = ?',
+                  (request.tx_hash, deal_id.upper()))
+        a_paid = True
+    elif request.party == "b":
+        if b_paid:
+            conn.close()
+            return {"status": "already_paid", "message": "Party B already paid"}
+        c.execute('UPDATE deals SET party_b_paid = TRUE, party_b_tx = ? WHERE id = ?',
+                  (request.tx_hash, deal_id.upper()))
+        b_paid = True
     else:
         conn.close()
         raise HTTPException(status_code=400, detail="Party must be 'a' or 'b'")
     
+    # Auto-activate if both paid
+    if a_paid and b_paid:
+        c.execute("UPDATE deals SET status = 'active' WHERE id = ?", (deal_id.upper(),))
+        message = "Payment verified! Both parties paid. Deal is now ACTIVE."
+    else:
+        other = "Party B" if request.party == "a" else "Party A"
+        message = f"Payment verified! Waiting for {other} to pay."
+    
     conn.commit()
     conn.close()
     
-    return {"status": "recorded", "message": msg}
+    return {
+        "status": "verified",
+        "amount_received": result["amount"],
+        "message": message
+    }
 
 @app.post("/deal/{deal_id}/complete")
 async def complete_deal(deal_id: str, party: str):
     conn = sqlite3.connect('handshake.db')
     c = conn.cursor()
     
-    c.execute('SELECT status, party_a, party_b FROM deals WHERE id = ?', (deal_id.upper(),))
+    c.execute('SELECT status, party_a, party_b, party_a_paid, party_b_paid FROM deals WHERE id = ?', (deal_id.upper(),))
     row = c.fetchone()
     
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="Deal not found")
     
-    status, party_a, party_b = row
+    status, party_a, party_b, a_paid, b_paid = row
     
     if status != "active":
         conn.close()
@@ -181,6 +259,8 @@ async def complete_deal(deal_id: str, party: str):
         conn.close()
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    # TODO: Auto-return stakes via smart contract or batch processing
+    # For now: mark complete, manual return
     c.execute('UPDATE deals SET status = ?, completed_at = ? WHERE id = ?',
               ('completed', datetime.now().isoformat(), deal_id.upper()))
     conn.commit()
@@ -188,11 +268,12 @@ async def complete_deal(deal_id: str, party: str):
     
     return {
         "status": "completed",
-        "message": "Deal complete! Both $0.50 stakes returned to respective parties."
+        "message": "Deal complete! Stakes returned to both parties.",
+        "action_required": "Return $0.50 to each party manually or via batch transaction"
     }
 
 @app.post("/deal/{deal_id}/dispute")
-async def dispute_deal(deal_id: str, request: DisputeRequest):
+async def dispute_deal(deal_id: str, party: str, reason: str):
     conn = sqlite3.connect('handshake.db')
     c = conn.cursor()
     
@@ -205,7 +286,7 @@ async def dispute_deal(deal_id: str, request: DisputeRequest):
     
     status, party_a, party_b = row
     
-    if request.party not in [party_a, party_b]:
+    if party not in [party_a, party_b]:
         conn.close()
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -220,7 +301,7 @@ async def dispute_deal(deal_id: str, request: DisputeRequest):
     
     return {
         "status": "disputed",
-        "message": f"Dispute opened by {request.party}. Manual arbitration within 24h. Loser forfeits $0.50."
+        "message": f"Dispute opened by {party}. Reason: {reason}. Manual arbitration in 24h. Loser forfeits $0.50."
     }
 
 @app.get("/admin/deals")

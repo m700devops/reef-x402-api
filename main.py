@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from datetime import datetime
@@ -14,7 +14,7 @@ app = FastAPI(title="Backend Utilities API", version="1.0.0")
 # Configuration
 RECEIVER_ADDRESS = "0xd9f3cab9a103f76ceebe70513ee6d2499b40a650"
 PRICE = "$0.01"
-NETWORK = "eip155:8453"  # Base Mainnet
+NETWORK = "eip155:84532"  # Base Sepolia Testnet
 
 # Stats tracking
 api_stats = {
@@ -24,9 +24,9 @@ api_stats = {
     "current_date": datetime.now().strftime("%Y-%m-%d")
 }
 
-# Create facilitator client (testnet)
+# Create facilitator client (testnet - no auth required)
 facilitator = HTTPFacilitatorClient(
-    FacilitatorConfig(url="https://api.cdp.coinbase.com/platform/v2/x402")
+    FacilitatorConfig(url="https://x402.org/facilitator")
 )
 
 # Create resource server and register EVM scheme
@@ -347,6 +347,253 @@ async def analyze_text(request: TextRequest) -> TextResponse:
         line_count=line_count,
         avg_word_length=round(avg_word_length, 2)
     )
+
+# ============================================================================
+# HANDSHAKE - Deal Insurance Service
+# ============================================================================
+
+import sqlite3
+import uuid
+
+# Initialize Handshake database
+def init_handshake_db():
+    conn = sqlite3.connect('handshake.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS deals (
+            id TEXT PRIMARY KEY,
+            party_a TEXT NOT NULL,
+            party_a_wallet TEXT NOT NULL,
+            party_b TEXT NOT NULL,
+            party_b_wallet TEXT NOT NULL,
+            terms TEXT NOT NULL,
+            amount REAL NOT NULL,
+            status TEXT DEFAULT 'pending',
+            party_a_paid BOOLEAN DEFAULT FALSE,
+            party_b_paid BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            disputed_at TIMESTAMP,
+            dispute_resolution TEXT,
+            winner TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_handshake_db()
+
+class HandshakeCreateRequest(BaseModel):
+    party_a: str
+    party_a_wallet: str
+    party_b: str
+    party_b_wallet: str
+    terms: str
+    amount: float
+
+class HandshakeCreateResponse(BaseModel):
+    id: str
+    status: str
+    message: str
+    party_a_pay_url: str
+    party_b_pay_url: str
+
+class HandshakeDealResponse(BaseModel):
+    id: str
+    party_a: str
+    party_a_wallet: str
+    party_b: str
+    party_b_wallet: str
+    terms: str
+    amount: float
+    status: str
+    party_a_paid: bool
+    party_b_paid: bool
+    created_at: str
+    completed_at: Optional[str] = None
+    disputed_at: Optional[str] = None
+
+class HandshakeDisputeRequest(BaseModel):
+    party: str
+    reason: str
+
+# Update routes to include handshake
+routes["POST /handshake/create"] = RouteConfig(
+    accepts=[
+        PaymentOption(
+            scheme="exact",
+            pay_to=RECEIVER_ADDRESS,
+            price="$0.50",
+            network="eip155:84532",  # Testnet for MVP
+        ),
+    ],
+    mime_type="application/json",
+    description="Create a handshake deal ($0.50)",
+)
+
+@app.post("/handshake/create", response_model=HandshakeCreateResponse)
+async def handshake_create(request: HandshakeCreateRequest) -> HandshakeCreateResponse:
+    """Create a new handshake deal. Costs $0.50 to create (party A pays)."""
+    deal_id = str(uuid.uuid4())[:8]
+    
+    conn = sqlite3.connect('handshake.db')
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO deals (id, party_a, party_a_wallet, party_b, party_b_wallet, terms, amount, party_a_paid)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (deal_id, request.party_a, request.party_a_wallet, 
+          request.party_b, request.party_b_wallet, request.terms, request.amount, True))
+    conn.commit()
+    conn.close()
+    
+    return HandshakeCreateResponse(
+        id=deal_id,
+        status="pending",
+        message=f"Deal created! ID: {deal_id}. Party B must pay $0.50 to activate. Terms: {request.terms[:100]}...",
+        party_a_pay_url="N/A (already paid)",
+        party_b_pay_url=f"https://reef-x402-api.onrender.com/handshake/pay/{deal_id}/b"
+    )
+
+@app.get("/handshake/{deal_id}", response_model=HandshakeDealResponse)
+async def handshake_get(deal_id: str) -> HandshakeDealResponse:
+    """Get deal status."""
+    conn = sqlite3.connect('handshake.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM deals WHERE id = ?', (deal_id,))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    
+    return HandshakeDealResponse(
+        id=row[0],
+        party_a=row[1],
+        party_a_wallet=row[2],
+        party_b=row[3],
+        party_b_wallet=row[4],
+        terms=row[5],
+        amount=row[6],
+        status=row[7],
+        party_a_paid=row[8],
+        party_b_paid=row[9],
+        created_at=row[10],
+        completed_at=row[11],
+        disputed_at=row[12]
+    )
+
+@app.post("/handshake/{deal_id}/pay")
+async def handshake_pay(deal_id: str, party: str) -> dict[str, str]:
+    """Record payment from party B (simplified - in production this would be webhook from x402)."""
+    if party != "b":
+        raise HTTPException(status_code=400, detail="Only party B needs to pay via this endpoint")
+    
+    conn = sqlite3.connect('handshake.db')
+    c = conn.cursor()
+    
+    c.execute('SELECT status, party_b_paid FROM deals WHERE id = ?', (deal_id,))
+    row = c.fetchone()
+    
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Deal not found")
+    
+    status, paid = row
+    
+    if paid:
+        conn.close()
+        return {"status": "already_paid", "message": "Party B has already paid"}
+    
+    c.execute('UPDATE deals SET party_b_paid = TRUE, status = ? WHERE id = ?', 
+              ('active' if status == 'pending' else status, deal_id))
+    conn.commit()
+    conn.close()
+    
+    return {"status": "paid", "message": "Party B payment recorded. Deal is now ACTIVE."}
+
+@app.post("/handshake/{deal_id}/complete")
+async def handshake_complete(deal_id: str, party: str) -> dict[str, str]:
+    """Mark deal complete (either party)."""
+    conn = sqlite3.connect('handshake.db')
+    c = conn.cursor()
+    
+    c.execute('SELECT status, party_a, party_b FROM deals WHERE id = ?', (deal_id,))
+    row = c.fetchone()
+    
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Deal not found")
+    
+    status, party_a, party_b = row
+    
+    if status != "active":
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Deal is {status}, not active")
+    
+    if party not in [party_a, party_b]:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    c.execute('UPDATE deals SET status = ?, completed_at = ? WHERE id = ?',
+              ('completed', datetime.now().isoformat(), deal_id))
+    conn.commit()
+    conn.close()
+    
+    return {"status": "completed", "message": "Deal completed! Both parties can withdraw their $0.50 stake."}
+
+@app.post("/handshake/{deal_id}/dispute")
+async def handshake_dispute(deal_id: str, request: HandshakeDisputeRequest) -> dict[str, str]:
+    """Open dispute."""
+    conn = sqlite3.connect('handshake.db')
+    c = conn.cursor()
+    
+    c.execute('SELECT status, party_a, party_b FROM deals WHERE id = ?', (deal_id,))
+    row = c.fetchone()
+    
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Deal not found")
+    
+    status, party_a, party_b = row
+    
+    if request.party not in [party_a, party_b]:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    if status not in ["active", "pending"]:
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Cannot dispute {status} deal")
+    
+    c.execute('UPDATE deals SET status = ?, disputed_at = ? WHERE id = ?',
+              ('disputed', datetime.now().isoformat(), deal_id))
+    conn.commit()
+    conn.close()
+    
+    return {
+        "status": "disputed",
+        "message": f"Dispute opened by {request.party}. Reason: {request.reason}. Manual arbitration within 24h. Both stakes held until resolution."
+    }
+
+@app.get("/handshake/admin/deals")
+async def handshake_list_deals() -> list[dict[str, Any]]:
+    """List all deals (admin)."""
+    conn = sqlite3.connect('handshake.db')
+    c = conn.cursor()
+    c.execute('SELECT id, party_a, party_b, status, amount, created_at FROM deals ORDER BY created_at DESC')
+    rows = c.fetchall()
+    conn.close()
+    
+    return [
+        {
+            "id": row[0],
+            "party_a": row[1],
+            "party_b": row[2],
+            "status": row[3],
+            "amount": row[4],
+            "created_at": row[5]
+        }
+        for row in rows
+    ]
 
 if __name__ == "__main__":
     import uvicorn

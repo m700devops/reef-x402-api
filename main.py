@@ -13,7 +13,7 @@ app = FastAPI(title="Backend Utilities API", version="1.0.0")
 # Configuration
 RECEIVER_ADDRESS = "0xd9f3cab9a103f76ceebe70513ee6d2499b40a650"
 PRICE = "$0.01"
-NETWORK = "eip155:8453"  # Base Sepolia testnet
+NETWORK = "eip155:8453"  # Base Mainnet
 
 # Create facilitator client (testnet)
 facilitator = HTTPFacilitatorClient(
@@ -126,7 +126,7 @@ async def root() -> dict[str, Any]:
         "price_per_request": PRICE,
         "payment_method": "x402",
         "receiver": RECEIVER_ADDRESS,
-        "network": "Base Sepolia Testnet",
+        "network": "Base Mainnet",
         "endpoints": [
             "POST /v1/validate/email",
             "POST /v1/validate/url",

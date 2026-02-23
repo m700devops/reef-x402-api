@@ -1,141 +1,89 @@
-# Backend Utilities API
+# Backend Utilities API + Handshake MVP
 
-Pay-per-request API for common backend tasks. Built with x402 — accepts USDC on Base Sepolia (testnet).
-
-**Price:** $0.01 USD per request
+FastAPI service with x402 micropayments. Deployed on Render.
 
 ## Endpoints
 
-### POST /v1/validate/email
-Validate email format and check MX records.
+### Utilities ($0.01 per request)
+- `POST /v1/validate/email` - Email validation with MX check
+- `POST /v1/validate/url` - URL validation with reachability check  
+- `POST /v1/transform/csv-to-json` - CSV to JSON conversion
+- `POST /v1/analyze/text` - Text statistics
 
-**Request:**
-```json
-{"email": "user@example.com"}
-```
+### Handshake MVP ($0.50 per party)
 
-**Response:**
-```json
-{
-  "valid": true,
-  "format_valid": true,
-  "mx_valid": true,
-  "message": "Valid email"
-}
-```
+Simple off-chain deal escrow for agent-to-agent transactions.
 
-### POST /v1/validate/url
-Validate URL format and check if reachable.
+**Flow:**
+1. Party A calls `/handshake/create` ($0.50) → Deal status: `pending_b`
+2. Party B calls `/handshake/{id}/join` ($0.50) → Deal status: `active`
+3. Both parties call `/handshake/{id}/complete` → Deal status: `completed`
+4. Either party can call `/handshake/{id}/dispute` → Manual review
 
-**Request:**
-```json
-{"url": "https://example.com"}
-```
+**Revenue:** $1.00 per completed deal (no gas costs)
 
-**Response:**
-```json
-{
-  "valid": true,
-  "format_valid": true,
-  "reachable": true,
-  "status_code": 200,
-  "message": "URL is valid and reachable"
-}
-```
+## Endpoints
 
-### POST /v1/transform/csv-to-json
-Convert CSV text to JSON array.
+| Method | Endpoint | Payment | Description |
+|--------|----------|---------|-------------|
+| POST | `/handshake/create` | $0.50 | Create deal (Party A) |
+| POST | `/handshake/{id}/join` | $0.50 | Join deal (Party B) |
+| POST | `/handshake/{id}/complete` | Free | Mark complete |
+| POST | `/handshake/{id}/dispute` | Free | Open dispute |
+| GET | `/handshake/{id}` | Free | Get deal status |
 
-**Request:**
-```json
-{
-  "csv": "name,age\nJohn,30\nJane,25",
-  "headers": true
-}
-```
+## Request Examples
 
-**Response:**
-```json
-{
-  "data": [
-    {"name": "John", "age": "30"},
-    {"name": "Jane", "age": "25"}
-  ],
-  "count": 2
-}
-```
-
-### POST /v1/analyze/text
-Analyze text statistics.
-
-**Request:**
-```json
-{"text": "Hello world this is a test"}
-```
-
-**Response:**
-```json
-{
-  "word_count": 6,
-  "char_count": 26,
-  "char_count_no_spaces": 21,
-  "line_count": 1,
-  "avg_word_length": 4.17
-}
-```
-
-## Payment
-
-This API uses [x402](https://x402.org) for micropayments.
-
-**Receiver:** `0xd9f3cab9a103f76ceebe70513ee6d2499b40a650`  
-**Network:** Base Sepolia (testnet)  
-**Price:** $0.01 USD per request in USDC
-
-### How to Pay
-
-1. Make a request without payment → Get `402 Payment Required` response
-2. Sign payment payload with your wallet
-3. Retry with `PAYMENT-SIGNATURE` header
-4. Receive your API response
-
-Or use the [x402 CLI](https://github.com/coinbase/x402):
+### Create Deal
 ```bash
-x402 curl -X POST https://api.example.com/v1/validate/email \
+curl -X POST https://reef-x402-api.onrender.com/handshake/create \
   -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com"}'
+  -H "X-Payment: ..." \
+  -d '{
+    "party_a_wallet": "0x...",
+    "party_b_wallet": "0x...",
+    "terms": "Build a Discord bot for $100",
+    "deal_amount": 100
+  }'
 ```
 
-## Deployment
-
-### Render (Free Tier)
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/yourusername/backend-utils-api)
-
-### Docker
+### Complete Deal
 ```bash
-docker build -t backend-utils-api .
-docker run -p 8080:8080 backend-utils-api
+curl -X POST https://reef-x402-api.onrender.com/handshake/abc123/complete \
+  -H "Content-Type: application/json" \
+  -d '{"wallet": "0x..."}'
 ```
 
-### Local
+## Database Schema (SQLite)
+
+```sql
+deals:
+  - deal_id (primary key)
+  - party_a_wallet
+  - party_b_wallet
+  - terms (text)
+  - deal_amount (float)
+  - status: pending_b | active | pending_completion | completed | disputed
+  - party_a_completed (bool)
+  - party_b_completed (bool)
+  - created_at
+  - updated_at
+  - completed_at
+  - disputed_at
+```
+
+## Revenue
+
+- $0.50 from Party A + $0.50 from Party B = $1.00 per deal
+- No smart contract gas fees
+- Manual dispute resolution (for now)
+
+## Deploy
+
 ```bash
-pip install -r requirements.txt
-uvicorn main:app --reload
+git add .
+git commit -m "Add Handshake MVP"
+git push origin main
 ```
 
-## Use Cases
-
-- **Form validation** — Validate user emails in real-time
-- **Data pipelines** — Transform CSV uploads to structured JSON
-- **Content analysis** — Word counts, readability metrics
-- **URL monitoring** — Check if links are still active
-
-## Tech Stack
-
-- FastAPI
-- x402 payment middleware
-- Python 3.12+
-
-## License
-
-MIT
+Render auto-deploys on push.

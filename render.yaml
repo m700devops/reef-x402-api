@@ -1,11 +1,19 @@
 services:
   - type: web
-    name: backend-utils-api
+    name: reef-x402-api
     runtime: python
-    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 8080
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: RECEIVER_ADDRESS
+        value: 0xd9f3cab9a103f76ceebe70513ee6d2499b40a650
+      - key: NETWORK
+        value: eip155:8453
+      - key: DB_PATH
+        value: handshake.db
       - key: PYTHON_VERSION
-        value: 3.12
-    healthCheckPath: /health
+        value: 3.11
+    disk:
+      name: handshake-db
+      mountPath: /opt/render/project/src
+      sizeGB: 1

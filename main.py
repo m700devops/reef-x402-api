@@ -1,7 +1,10 @@
 from typing import Any, Optional
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from datetime import datetime
+import sqlite3
+import uuid
+import os
 
 from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
@@ -9,12 +12,13 @@ from x402.http.types import RouteConfig
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
 from x402.server import x402ResourceServer
 
-app = FastAPI(title="Backend Utilities API", version="1.0.0")
+app = FastAPI(title="Backend Utilities API + Handshake MVP", version="2.0.0")
 
 # Configuration
-RECEIVER_ADDRESS = "0xd9f3cab9a103f76ceebe70513ee6d2499b40a650"
+RECEIVER_ADDRESS = os.getenv("RECEIVER_ADDRESS", "0xd9f3cab9a103f76ceebe70513ee6d2499b40a650")
 PRICE = "$0.01"
-NETWORK = "eip155:84532"  # Base Sepolia Testnet
+HANDSHAKE_PRICE = "$0.50"
+NETWORK = os.getenv("NETWORK", "eip155:8453")  # Base Mainnet default
 
 # Stats tracking
 api_stats = {
@@ -24,71 +28,90 @@ api_stats = {
     "current_date": datetime.now().strftime("%Y-%m-%d")
 }
 
-# Create facilitator client (testnet - no auth required)
+# Create facilitator client
 facilitator = HTTPFacilitatorClient(
-    FacilitatorConfig(url="https://x402.org/facilitator")
+    FacilitatorConfig(url="https://api.cdp.coinbase.com/platform/v2/x402")
 )
 
 # Create resource server and register EVM scheme
 server = x402ResourceServer(facilitator)
 server.register(NETWORK, ExactEvmServerScheme())
 
-# Define protected routes
+# ============================================================================
+# HANDSHAKE DATABASE
+# ============================================================================
+DB_PATH = os.getenv("DB_PATH", "handshake.db")
+
+def init_handshake_db():
+    """Initialize SQLite database with clean MVP schema."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS deals (
+            deal_id TEXT PRIMARY KEY,
+            party_a_wallet TEXT NOT NULL,
+            party_b_wallet TEXT,
+            terms TEXT NOT NULL,
+            deal_amount REAL NOT NULL,
+            status TEXT DEFAULT 'pending_b',
+            party_a_completed BOOLEAN DEFAULT FALSE,
+            party_b_completed BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            disputed_at TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_handshake_db()
+
+# ============================================================================
+# ROUTE CONFIGS FOR X402 PAYMENTS
+# ============================================================================
 routes: dict[str, RouteConfig] = {
+    # Utility endpoints
     "POST /v1/validate/email": RouteConfig(
-        accepts=[
-            PaymentOption(
-                scheme="exact",
-                pay_to=RECEIVER_ADDRESS,
-                price=PRICE,
-                network=NETWORK,
-            ),
-        ],
+        accepts=[PaymentOption(scheme="exact", pay_to=RECEIVER_ADDRESS, price=PRICE, network=NETWORK)],
         mime_type="application/json",
         description="Validate email format and MX records",
     ),
     "POST /v1/validate/url": RouteConfig(
-        accepts=[
-            PaymentOption(
-                scheme="exact",
-                pay_to=RECEIVER_ADDRESS,
-                price=PRICE,
-                network=NETWORK,
-            ),
-        ],
+        accepts=[PaymentOption(scheme="exact", pay_to=RECEIVER_ADDRESS, price=PRICE, network=NETWORK)],
         mime_type="application/json",
         description="Validate URL format and check reachability",
     ),
     "POST /v1/transform/csv-to-json": RouteConfig(
-        accepts=[
-            PaymentOption(
-                scheme="exact",
-                pay_to=RECEIVER_ADDRESS,
-                price=PRICE,
-                network=NETWORK,
-            ),
-        ],
+        accepts=[PaymentOption(scheme="exact", pay_to=RECEIVER_ADDRESS, price=PRICE, network=NETWORK)],
         mime_type="application/json",
         description="Convert CSV text to JSON array",
     ),
     "POST /v1/analyze/text": RouteConfig(
-        accepts=[
-            PaymentOption(
-                scheme="exact",
-                pay_to=RECEIVER_ADDRESS,
-                price=PRICE,
-                network=NETWORK,
-            ),
-        ],
+        accepts=[PaymentOption(scheme="exact", pay_to=RECEIVER_ADDRESS, price=PRICE, network=NETWORK)],
         mime_type="application/json",
         description="Analyze text statistics",
     ),
+    # Handshake endpoints
+    "POST /handshake/create": RouteConfig(
+        accepts=[PaymentOption(scheme="exact", pay_to=RECEIVER_ADDRESS, price=HANDSHAKE_PRICE, network=NETWORK)],
+        mime_type="application/json",
+        description="Create handshake deal - $0.50 from Party A",
+    ),
+    "POST /handshake/{deal_id}/join": RouteConfig(
+        accepts=[PaymentOption(scheme="exact", pay_to=RECEIVER_ADDRESS, price=HANDSHAKE_PRICE, network=NETWORK)],
+        mime_type="application/json",
+        description="Join handshake deal - $0.50 from Party B",
+    ),
 }
 
-# Add payment middleware
 app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=server)
 
-# Request/Response models
+# ============================================================================
+# REQUEST/RESPONSE MODELS
+# ============================================================================
+
+# Utility models
 class EmailRequest(BaseModel):
     email: str
 
@@ -132,12 +155,63 @@ class StatsResponse(BaseModel):
     last_request_time: str | None
     current_date: str
 
+# Handshake models
+class CreateDealRequest(BaseModel):
+    party_a_wallet: str
+    party_b_wallet: str
+    terms: str
+    deal_amount: float
+
+class CreateDealResponse(BaseModel):
+    deal_id: str
+    status: str
+    message: str
+    share_url: str
+
+class JoinDealResponse(BaseModel):
+    deal_id: str
+    status: str
+    party_a_wallet: str
+    party_b_wallet: str
+    terms: str
+    deal_amount: float
+    message: str
+
+class DealResponse(BaseModel):
+    deal_id: str
+    party_a_wallet: str
+    party_b_wallet: str | None
+    terms: str
+    deal_amount: float
+    status: str
+    party_a_completed: bool
+    party_b_completed: bool
+    created_at: str
+    updated_at: str
+    completed_at: str | None
+    disputed_at: str | None
+
+class CompleteResponse(BaseModel):
+    deal_id: str
+    status: str
+    party_a_completed: bool
+    party_b_completed: bool
+    message: str
+
+class DisputeResponse(BaseModel):
+    deal_id: str
+    status: str
+    message: str
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
 def update_stats():
     """Update request statistics."""
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
     
-    # Reset daily counter if date changed
     if api_stats["current_date"] != today:
         api_stats["requests_today"] = 0
         api_stats["current_date"] = today
@@ -146,32 +220,51 @@ def update_stats():
     api_stats["requests_today"] += 1
     api_stats["last_request_time"] = now.isoformat()
 
-# Free endpoints (no payment required)
+def generate_deal_id() -> str:
+    """Generate short unique deal ID."""
+    return str(uuid.uuid4())[:10]
+
+def get_db():
+    """Get database connection."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# ============================================================================
+# FREE ENDPOINTS
+# ============================================================================
+
 @app.get("/")
-async def root() -> dict[str, Any]:
+async def root():
     return {
-        "name": "Backend Utilities API",
-        "version": "1.0.0",
-        "price_per_request": PRICE,
-        "payment_method": "x402",
+        "name": "Backend Utilities API + Handshake MVP",
+        "version": "2.0.0",
+        "endpoints": {
+            "utilities": [
+                "POST /v1/validate/email - $0.01",
+                "POST /v1/validate/url - $0.01", 
+                "POST /v1/transform/csv-to-json - $0.01",
+                "POST /v1/analyze/text - $0.01",
+            ],
+            "handshake": [
+                "POST /handshake/create - $0.50 (Party A)",
+                "POST /handshake/{deal_id}/join - $0.50 (Party B)",
+                "POST /handshake/{deal_id}/complete",
+                "POST /handshake/{deal_id}/dispute",
+                "GET /handshake/{deal_id}",
+            ]
+        },
         "receiver": RECEIVER_ADDRESS,
-        "network": "Base Mainnet",
-        "endpoints": [
-            "POST /v1/validate/email",
-            "POST /v1/validate/url",
-            "POST /v1/transform/csv-to-json",
-            "POST /v1/analyze/text",
-        ],
-        "documentation": "/docs",
+        "network": "Base Mainnet" if "8453" in NETWORK else "Base Sepolia",
+        "docs": "/docs",
     }
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "healthy"}
+async def health():
+    return {"status": "healthy", "version": "2.0.0"}
 
 @app.get("/stats", response_model=StatsResponse)
-async def stats() -> StatsResponse:
-    """Get API usage statistics."""
+async def stats():
     return StatsResponse(
         total_requests=api_stats["total_requests"],
         requests_today=api_stats["requests_today"],
@@ -179,35 +272,26 @@ async def stats() -> StatsResponse:
         current_date=api_stats["current_date"]
     )
 
-# Paid endpoints
+# ============================================================================
+# UTILITY ENDPOINTS (PAID)
+# ============================================================================
+
 @app.post("/v1/validate/email", response_model=EmailResponse)
-async def validate_email(request: EmailRequest) -> EmailResponse:
+async def validate_email(request: EmailRequest):
     update_stats()
     import re
     import socket
     
     email = request.email
     if not email:
-        return EmailResponse(
-            valid=False,
-            format_valid=False,
-            mx_valid=False,
-            message="Email required"
-        )
+        return EmailResponse(valid=False, format_valid=False, mx_valid=False, message="Email required")
     
-    # Format validation
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     format_valid = bool(re.match(pattern, email))
     
     if not format_valid:
-        return EmailResponse(
-            valid=False,
-            format_valid=False,
-            mx_valid=False,
-            message="Invalid email format"
-        )
+        return EmailResponse(valid=False, format_valid=False, mx_valid=False, message="Invalid email format")
     
-    # MX check
     domain = email.split('@')[1]
     mx_valid = False
     try:
@@ -224,7 +308,7 @@ async def validate_email(request: EmailRequest) -> EmailResponse:
     )
 
 @app.post("/v1/validate/url", response_model=UrlResponse)
-async def validate_url(request: UrlRequest) -> UrlResponse:
+async def validate_url(request: UrlRequest):
     update_stats()
     import urllib.request
     import urllib.error
@@ -232,15 +316,8 @@ async def validate_url(request: UrlRequest) -> UrlResponse:
     
     url = request.url
     if not url:
-        return UrlResponse(
-            valid=False,
-            format_valid=False,
-            reachable=False,
-            status_code=None,
-            message="URL required"
-        )
+        return UrlResponse(valid=False, format_valid=False, reachable=False, status_code=None, message="URL required")
     
-    # Format validation
     try:
         parsed = urlparse(url)
         format_valid = bool(parsed.scheme and parsed.netloc)
@@ -248,15 +325,8 @@ async def validate_url(request: UrlRequest) -> UrlResponse:
         format_valid = False
     
     if not format_valid:
-        return UrlResponse(
-            valid=False,
-            format_valid=False,
-            reachable=False,
-            status_code=None,
-            message="Invalid URL format"
-        )
+        return UrlResponse(valid=False, format_valid=False, reachable=False, status_code=None, message="Invalid URL format")
     
-    # Reachability check
     reachable = False
     status_code = None
     try:
@@ -279,7 +349,7 @@ async def validate_url(request: UrlRequest) -> UrlResponse:
     )
 
 @app.post("/v1/transform/csv-to-json", response_model=CsvResponse)
-async def csv_to_json(request: CsvRequest) -> CsvResponse:
+async def csv_to_json(request: CsvRequest):
     update_stats()
     csv_text = request.csv
     has_headers = request.headers
@@ -320,18 +390,12 @@ async def csv_to_json(request: CsvRequest) -> CsvResponse:
     return CsvResponse(data=data, count=len(data))
 
 @app.post("/v1/analyze/text", response_model=TextResponse)
-async def analyze_text(request: TextRequest) -> TextResponse:
+async def analyze_text(request: TextRequest):
     update_stats()
     text = request.text
     
     if not text:
-        return TextResponse(
-            word_count=0,
-            char_count=0,
-            char_count_no_spaces=0,
-            line_count=0,
-            avg_word_length=0.0
-        )
+        return TextResponse(word_count=0, char_count=0, char_count_no_spaces=0, line_count=0, avg_word_length=0.0)
     
     words = text.split()
     word_count = len(words)
@@ -349,252 +413,249 @@ async def analyze_text(request: TextRequest) -> TextResponse:
     )
 
 # ============================================================================
-# HANDSHAKE - Deal Insurance Service
+# HANDSHAKE MVP ENDPOINTS
 # ============================================================================
 
-import sqlite3
-import uuid
-
-# Initialize Handshake database
-def init_handshake_db():
-    conn = sqlite3.connect('handshake.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS deals (
-            id TEXT PRIMARY KEY,
-            party_a TEXT NOT NULL,
-            party_a_wallet TEXT NOT NULL,
-            party_b TEXT NOT NULL,
-            party_b_wallet TEXT NOT NULL,
-            terms TEXT NOT NULL,
-            amount REAL NOT NULL,
-            status TEXT DEFAULT 'pending',
-            party_a_paid BOOLEAN DEFAULT FALSE,
-            party_b_paid BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP,
-            disputed_at TIMESTAMP,
-            dispute_resolution TEXT,
-            winner TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_handshake_db()
-
-class HandshakeCreateRequest(BaseModel):
-    party_a: str
-    party_a_wallet: str
-    party_b: str
-    party_b_wallet: str
-    terms: str
-    amount: float
-
-class HandshakeCreateResponse(BaseModel):
-    id: str
-    status: str
-    message: str
-    party_a_pay_url: str
-    party_b_pay_url: str
-
-class HandshakeDealResponse(BaseModel):
-    id: str
-    party_a: str
-    party_a_wallet: str
-    party_b: str
-    party_b_wallet: str
-    terms: str
-    amount: float
-    status: str
-    party_a_paid: bool
-    party_b_paid: bool
-    created_at: str
-    completed_at: Optional[str] = None
-    disputed_at: Optional[str] = None
-
-class HandshakeDisputeRequest(BaseModel):
-    party: str
-    reason: str
-
-# Update routes to include handshake
-routes["POST /handshake/create"] = RouteConfig(
-    accepts=[
-        PaymentOption(
-            scheme="exact",
-            pay_to=RECEIVER_ADDRESS,
-            price="$0.50",
-            network="eip155:84532",  # Testnet for MVP
-        ),
-    ],
-    mime_type="application/json",
-    description="Create a handshake deal ($0.50)",
-)
-
-@app.post("/handshake/create", response_model=HandshakeCreateResponse)
-async def handshake_create(request: HandshakeCreateRequest) -> HandshakeCreateResponse:
-    """Create a new handshake deal. Costs $0.50 to create (party A pays)."""
-    deal_id = str(uuid.uuid4())[:8]
+@app.post("/handshake/create", response_model=CreateDealResponse)
+async def handshake_create(request: CreateDealRequest):
+    """
+    Create a new handshake deal. 
+    Requires $0.50 payment from Party A (enforced by middleware).
+    Status: pending_b (waiting for Party B to join)
+    """
+    deal_id = generate_deal_id()
+    now = datetime.now().isoformat()
     
-    conn = sqlite3.connect('handshake.db')
+    conn = get_db()
     c = conn.cursor()
     c.execute('''
-        INSERT INTO deals (id, party_a, party_a_wallet, party_b, party_b_wallet, terms, amount, party_a_paid)
+        INSERT INTO deals (deal_id, party_a_wallet, party_b_wallet, terms, deal_amount, status, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (deal_id, request.party_a, request.party_a_wallet, 
-          request.party_b, request.party_b_wallet, request.terms, request.amount, True))
+    ''', (deal_id, request.party_a_wallet, request.party_b_wallet, request.terms, 
+          request.deal_amount, 'pending_b', now, now))
     conn.commit()
     conn.close()
     
-    return HandshakeCreateResponse(
-        id=deal_id,
-        status="pending",
-        message=f"Deal created! ID: {deal_id}. Party B must pay $0.50 to activate. Terms: {request.terms[:100]}...",
-        party_a_pay_url="N/A (already paid)",
-        party_b_pay_url=f"https://reef-x402-api.onrender.com/handshake/pay/{deal_id}/b"
+    return CreateDealResponse(
+        deal_id=deal_id,
+        status="pending_b",
+        message=f"Deal created! Share this deal ID with Party B: {deal_id}",
+        share_url=f"https://reef-x402-api.onrender.com/handshake/{deal_id}"
     )
 
-@app.get("/handshake/{deal_id}", response_model=HandshakeDealResponse)
-async def handshake_get(deal_id: str) -> HandshakeDealResponse:
-    """Get deal status."""
-    conn = sqlite3.connect('handshake.db')
-    c = conn.cursor()
-    c.execute('SELECT * FROM deals WHERE id = ?', (deal_id,))
-    row = c.fetchone()
-    conn.close()
-    
-    if not row:
-        raise HTTPException(status_code=404, detail="Deal not found")
-    
-    return HandshakeDealResponse(
-        id=row[0],
-        party_a=row[1],
-        party_a_wallet=row[2],
-        party_b=row[3],
-        party_b_wallet=row[4],
-        terms=row[5],
-        amount=row[6],
-        status=row[7],
-        party_a_paid=row[8],
-        party_b_paid=row[9],
-        created_at=row[10],
-        completed_at=row[11],
-        disputed_at=row[12]
-    )
-
-@app.post("/handshake/{deal_id}/pay")
-async def handshake_pay(deal_id: str, party: str) -> dict[str, str]:
-    """Record payment from party B (simplified - in production this would be webhook from x402)."""
-    if party != "b":
-        raise HTTPException(status_code=400, detail="Only party B needs to pay via this endpoint")
-    
-    conn = sqlite3.connect('handshake.db')
+@app.post("/handshake/{deal_id}/join", response_model=JoinDealResponse)
+async def handshake_join(deal_id: str):
+    """
+    Party B joins the deal.
+    Requires $0.50 payment from Party B (enforced by middleware).
+    Status: active (both parties paid, deal is live)
+    """
+    conn = get_db()
     c = conn.cursor()
     
-    c.execute('SELECT status, party_b_paid FROM deals WHERE id = ?', (deal_id,))
+    c.execute('SELECT * FROM deals WHERE deal_id = ?', (deal_id,))
     row = c.fetchone()
     
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="Deal not found")
     
-    status, paid = row
+    deal = dict(row)
     
-    if paid:
+    if deal['status'] != 'pending_b':
         conn.close()
-        return {"status": "already_paid", "message": "Party B has already paid"}
+        raise HTTPException(status_code=400, detail=f"Deal status is '{deal['status']}', cannot join")
     
-    c.execute('UPDATE deals SET party_b_paid = TRUE, status = ? WHERE id = ?', 
-              ('active' if status == 'pending' else status, deal_id))
+    now = datetime.now().isoformat()
+    c.execute('UPDATE deals SET status = ?, updated_at = ? WHERE deal_id = ?',
+              ('active', now, deal_id))
     conn.commit()
     conn.close()
     
-    return {"status": "paid", "message": "Party B payment recorded. Deal is now ACTIVE."}
+    return JoinDealResponse(
+        deal_id=deal_id,
+        status="active",
+        party_a_wallet=deal['party_a_wallet'],
+        party_b_wallet=deal['party_b_wallet'],
+        terms=deal['terms'],
+        deal_amount=deal['deal_amount'],
+        message="Deal is now ACTIVE! Both parties have paid $0.50. Call /complete when finished."
+    )
 
-@app.post("/handshake/{deal_id}/complete")
-async def handshake_complete(deal_id: str, party: str) -> dict[str, str]:
-    """Mark deal complete (either party)."""
-    conn = sqlite3.connect('handshake.db')
+@app.get("/handshake/{deal_id}", response_model=DealResponse)
+async def handshake_get(deal_id: str):
+    """Get deal status and details."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM deals WHERE deal_id = ?', (deal_id,))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    
+    deal = dict(row)
+    return DealResponse(
+        deal_id=deal['deal_id'],
+        party_a_wallet=deal['party_a_wallet'],
+        party_b_wallet=deal['party_b_wallet'],
+        terms=deal['terms'],
+        deal_amount=deal['deal_amount'],
+        status=deal['status'],
+        party_a_completed=bool(deal['party_a_completed']),
+        party_b_completed=bool(deal['party_b_completed']),
+        created_at=deal['created_at'],
+        updated_at=deal['updated_at'],
+        completed_at=deal['completed_at'],
+        disputed_at=deal['disputed_at']
+    )
+
+@app.post("/handshake/{deal_id}/complete", response_model=CompleteResponse)
+async def handshake_complete(deal_id: str, request: Request):
+    """
+    Mark deal as complete. Called by either party.
+    Both parties must call complete for status to become "completed".
+    """
+    body = await request.json()
+    caller_wallet = body.get('wallet')
+    
+    if not caller_wallet:
+        raise HTTPException(status_code=400, detail="wallet address required")
+    
+    conn = get_db()
     c = conn.cursor()
     
-    c.execute('SELECT status, party_a, party_b FROM deals WHERE id = ?', (deal_id,))
+    c.execute('SELECT * FROM deals WHERE deal_id = ?', (deal_id,))
     row = c.fetchone()
     
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="Deal not found")
     
-    status, party_a, party_b = row
+    deal = dict(row)
     
-    if status != "active":
+    if deal['status'] not in ['active', 'pending_completion']:
         conn.close()
-        raise HTTPException(status_code=400, detail=f"Deal is {status}, not active")
+        raise HTTPException(status_code=400, detail=f"Deal status is '{deal['status']}', cannot complete")
     
-    if party not in [party_a, party_b]:
+    # Verify caller is a party
+    if caller_wallet not in [deal['party_a_wallet'], deal['party_b_wallet']]:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not authorized - caller is not a party to this deal")
+    
+    # Update completion flags
+    is_party_a = caller_wallet == deal['party_a_wallet']
+    now = datetime.now().isoformat()
+    
+    if is_party_a:
+        c.execute('UPDATE deals SET party_a_completed = TRUE, updated_at = ? WHERE deal_id = ?', (now, deal_id))
+    else:
+        c.execute('UPDATE deals SET party_b_completed = TRUE, updated_at = ? WHERE deal_id = ?', (now, deal_id))
+    
+    # Check if both completed
+    c.execute('SELECT party_a_completed, party_b_completed FROM deals WHERE deal_id = ?', (deal_id,))
+    comp_row = c.fetchone()
+    both_completed = comp_row['party_a_completed'] and comp_row['party_b_completed']
+    
+    if both_completed:
+        c.execute('UPDATE deals SET status = ?, completed_at = ?, updated_at = ? WHERE deal_id = ?',
+                  ('completed', now, now, deal_id))
+        message = "Deal COMPLETED! Both parties confirmed. $1.00 revenue captured."
+        final_status = "completed"
+    else:
+        c.execute('UPDATE deals SET status = ?, updated_at = ? WHERE deal_id = ?',
+                  ('pending_completion', now, deal_id))
+        other_party = "Party B" if is_party_a else "Party A"
+        message = f"Completion recorded. Waiting for {other_party} to confirm."
+        final_status = "pending_completion"
+    
+    conn.commit()
+    conn.close()
+    
+    return CompleteResponse(
+        deal_id=deal_id,
+        status=final_status,
+        party_a_completed=comp_row['party_a_completed'],
+        party_b_completed=comp_row['party_b_completed'],
+        message=message
+    )
+
+@app.post("/handshake/{deal_id}/dispute", response_model=DisputeResponse)
+async def handshake_dispute(deal_id: str, request: Request):
+    """
+    Open dispute. Called by either party.
+    Status becomes "disputed" - manual review required.
+    """
+    body = await request.json()
+    caller_wallet = body.get('wallet')
+    reason = body.get('reason', 'No reason provided')
+    
+    if not caller_wallet:
+        raise HTTPException(status_code=400, detail="wallet address required")
+    
+    conn = get_db()
+    c = conn.cursor()
+    
+    c.execute('SELECT * FROM deals WHERE deal_id = ?', (deal_id,))
+    row = c.fetchone()
+    
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Deal not found")
+    
+    deal = dict(row)
+    
+    if deal['status'] in ['completed', 'disputed']:
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Deal already {deal['status']}")
+    
+    if caller_wallet not in [deal['party_a_wallet'], deal['party_b_wallet']]:
         conn.close()
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    c.execute('UPDATE deals SET status = ?, completed_at = ? WHERE id = ?',
-              ('completed', datetime.now().isoformat(), deal_id))
+    now = datetime.now().isoformat()
+    c.execute('UPDATE deals SET status = ?, disputed_at = ?, updated_at = ? WHERE deal_id = ?',
+              ('disputed', now, now, deal_id))
     conn.commit()
     conn.close()
     
-    return {"status": "completed", "message": "Deal completed! Both parties can withdraw their $0.50 stake."}
-
-@app.post("/handshake/{deal_id}/dispute")
-async def handshake_dispute(deal_id: str, request: HandshakeDisputeRequest) -> dict[str, str]:
-    """Open dispute."""
-    conn = sqlite3.connect('handshake.db')
-    c = conn.cursor()
+    # Log for manual review
+    print(f"[DISPUTE] Deal {deal_id} disputed by {caller_wallet}")
+    print(f"[DISPUTE] Reason: {reason}")
+    print(f"[DISPUTE] Parties: A={deal['party_a_wallet']}, B={deal['party_b_wallet']}")
+    print(f"[DISPUTE] Terms: {deal['terms'][:200]}...")
     
-    c.execute('SELECT status, party_a, party_b FROM deals WHERE id = ?', (deal_id,))
-    row = c.fetchone()
-    
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Deal not found")
-    
-    status, party_a, party_b = row
-    
-    if request.party not in [party_a, party_b]:
-        conn.close()
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    if status not in ["active", "pending"]:
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"Cannot dispute {status} deal")
-    
-    c.execute('UPDATE deals SET status = ?, disputed_at = ? WHERE id = ?',
-              ('disputed', datetime.now().isoformat(), deal_id))
-    conn.commit()
-    conn.close()
-    
-    return {
-        "status": "disputed",
-        "message": f"Dispute opened by {request.party}. Reason: {request.reason}. Manual arbitration within 24h. Both stakes held until resolution."
-    }
+    return DisputeResponse(
+        deal_id=deal_id,
+        status="disputed",
+        message=f"Dispute opened. Manual review in progress. Evidence logged. Reason: {reason}"
+    )
 
 @app.get("/handshake/admin/deals")
-async def handshake_list_deals() -> list[dict[str, Any]]:
-    """List all deals (admin)."""
-    conn = sqlite3.connect('handshake.db')
+async def handshake_list_deals():
+    """List all deals (admin/debug)."""
+    conn = get_db()
     c = conn.cursor()
-    c.execute('SELECT id, party_a, party_b, status, amount, created_at FROM deals ORDER BY created_at DESC')
+    c.execute('''
+        SELECT deal_id, party_a_wallet, party_b_wallet, status, deal_amount, created_at 
+        FROM deals ORDER BY created_at DESC
+    ''')
     rows = c.fetchall()
     conn.close()
     
     return [
         {
-            "id": row[0],
-            "party_a": row[1],
-            "party_b": row[2],
-            "status": row[3],
-            "amount": row[4],
-            "created_at": row[5]
+            "deal_id": row['deal_id'],
+            "party_a_wallet": row['party_a_wallet'],
+            "party_b_wallet": row['party_b_wallet'],
+            "status": row['status'],
+            "deal_amount": row['deal_amount'],
+            "created_at": row['created_at']
         }
         for row in rows
     ]
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)

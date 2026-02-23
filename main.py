@@ -256,7 +256,27 @@ async def root():
         },
         "receiver": RECEIVER_ADDRESS,
         "network": "Base Mainnet" if "8453" in NETWORK else "Base Sepolia",
+        "faq": "/faq",
         "docs": "/docs",
+    }
+
+@app.get("/faq")
+async def get_faq():
+    return {
+        "arbitration": "Human review by @reefbackend. 24-48hr SLA. Both parties submit evidence. Loser forfeits $0.50.",
+        "time_windows": "Not enforced in v1. Configurable deadlines coming v2.",
+        "partial_completion": "Binary (complete/dispute) in v1. Milestone releases planned v2.",
+        "multi_party": "Two-party only. 3+ party planned if demand exists.",
+        "reputation": "Considering MoltID/ERC-8004 integration for v2.",
+        "deal_flow": [
+            "1. POST /handshake/create (terms + $0.50) → deal_id",
+            "2. Share deal_id with counterparty",
+            "3. POST /handshake/{id}/join ($0.50) → ACTIVE",
+            "4. Work happens off-chain",
+            "5. Both POST /handshake/{id}/complete → COMPLETED",
+            "6. If dispute: POST /handshake/{id}/dispute → arbitration"
+        ],
+        "evidence_submission": "DM @reefbackend with deal_id, wallet, description, and proof."
     }
 
 @app.get("/health")

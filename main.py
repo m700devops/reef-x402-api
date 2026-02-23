@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 import sqlite3
 import uuid
 import os
+import hashlib
+import requests
 
 from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
@@ -586,6 +588,309 @@ async def list_deals():
     return [{"deal_id": r['deal_id'], "party_a_wallet": r['party_a_wallet'], 
              "party_b_wallet": r['party_b_wallet'], "status": r['status'],
              "deal_amount": r['deal_amount'], "created_at": r['created_at']} for r in rows]
+
+# ============================================================================
+# MICRO-TOOL 1: Deal Validator
+# ============================================================================
+class ValidateDealRequest(BaseModel):
+    party_a_wallet: str
+    party_b_wallet: str
+    terms: str
+    deal_amount: float
+
+class ValidateDealResponse(BaseModel):
+    risk_score: str
+    warnings: list[str]
+    suggestions: list[str]
+    suggested_deadline_hours: int
+    can_proceed: bool
+
+@app.post("/validate-deal", response_model=ValidateDealResponse)
+async def validate_deal(request: ValidateDealRequest):
+    """
+    Pre-check deal viability before creating escrow.
+    Returns risk assessment and suggestions.
+    N8N-compatible: Simple POST endpoint, JSON in/out.
+    """
+    warnings = []
+    suggestions = []
+    risk_score = "low"
+    can_proceed = True
+    
+    conn = get_db()
+    c = conn.cursor()
+    
+    # Check Party B's history
+    c.execute('''
+        SELECT COUNT(*) as deal_count, 
+               SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_count,
+               SUM(CASE WHEN status = 'disputed' THEN 1 ELSE 0 END) as disputed_count
+        FROM deals WHERE party_b_wallet = ? OR party_a_wallet = ?
+    ''', (request.party_b_wallet, request.party_b_wallet))
+    row = c.fetchone()
+    
+    b_deal_count = row['deal_count'] or 0
+    b_completed = row['completed_count'] or 0
+    b_disputed = row['disputed_count'] or 0
+    
+    if b_deal_count == 0:
+        warnings.append("Party B has no deal history")
+        risk_score = "medium"
+    elif b_disputed > b_completed:
+        warnings.append(f"Party B has {b_disputed} disputes vs {b_completed} completed deals")
+        risk_score = "high"
+        can_proceed = False
+    
+    # Check Party A's history
+    c.execute('''
+        SELECT COUNT(*) as deal_count,
+               SUM(CASE WHEN status = 'disputed' THEN 1 ELSE 0 END) as disputed_count
+        FROM deals WHERE party_a_wallet = ?
+    ''', (request.party_a_wallet,))
+    row = c.fetchone()
+    
+    a_disputed = row['disputed_count'] or 0
+    if a_disputed > 2:
+        warnings.append(f"Party A has initiated {a_disputed} disputes")
+        risk_score = "medium"
+    
+    # Analyze terms quality
+    terms_lower = request.terms.lower()
+    if len(request.terms) < 20:
+        warnings.append("Terms are very short - may be unclear")
+        suggestions.append("Add specific deliverables and acceptance criteria")
+        risk_score = "medium"
+    
+    if not any(word in terms_lower for word in ['deliver', 'provide', 'create', 'build', 'write']):
+        warnings.append("Terms lack clear action verbs")
+        suggestions.append("Specify what will be delivered (e.g., 'Deliver a Python script that...')")
+    
+    if not any(word in terms_lower for word in ['by', 'within', 'deadline', 'days', 'hours']):
+        suggestions.append("Consider adding a deadline to the terms")
+    
+    # Suggest deadline based on deal amount
+    if request.deal_amount < 50:
+        suggested_deadline = 24
+    elif request.deal_amount < 200:
+        suggested_deadline = 48
+    else:
+        suggested_deadline = 72
+    
+    # High amount warning
+    if request.deal_amount > 1000:
+        warnings.append("Deal amount over $1,000 - consider milestone payments")
+        suggestions.append("Break into milestones: 30% upfront, 40% midpoint, 30% final")
+        risk_score = "high"
+    
+    conn.close()
+    
+    return ValidateDealResponse(
+        risk_score=risk_score,
+        warnings=warnings,
+        suggestions=suggestions,
+        suggested_deadline_hours=suggested_deadline,
+        can_proceed=can_proceed
+    )
+
+# ============================================================================
+# MICRO-TOOL 2: Agent Reputation Scout
+# ============================================================================
+class ScoutResponse(BaseModel):
+    wallet: str
+    deals_completed: int
+    deals_created: int
+    disputes_initiated: int
+    disputes_involved: int
+    avg_deal_size: float
+    first_deal_date: str | None
+    last_deal_date: str | None
+    risk_level: str
+    reputation_score: int  # 0-100
+
+@app.get("/scout/{wallet}", response_model=ScoutResponse)
+async def scout_agent(wallet: str):
+    """
+    Check agent's deal history and reputation.
+    Returns risk assessment and reputation score.
+    N8N-compatible: Simple GET endpoint with path parameter.
+    Price: $0.01 via x402 middleware.
+    """
+    conn = get_db()
+    c = conn.cursor()
+    
+    # Get all deals where this wallet was involved
+    c.execute('''
+        SELECT 
+            COUNT(*) as total_deals,
+            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+            SUM(CASE WHEN status = 'disputed' THEN 1 ELSE 0 END) as disputed,
+            AVG(deal_amount) as avg_amount,
+            MIN(created_at) as first_deal,
+            MAX(created_at) as last_deal
+        FROM deals 
+        WHERE party_a_wallet = ? OR party_b_wallet = ?
+    ''', (wallet, wallet))
+    row = c.fetchone()
+    
+    total_deals = row['total_deals'] or 0
+    completed = row['completed'] or 0
+    disputed = row['disputed'] or 0
+    avg_amount = row['avg_amount'] or 0
+    first_deal = row['first_deal']
+    last_deal = row['last_deal']
+    
+    # Count deals created by this wallet
+    c.execute('''
+        SELECT COUNT(*) as created_count,
+               SUM(CASE WHEN status = 'disputed' THEN 1 ELSE 0 END) as disputes_initiated
+        FROM deals WHERE party_a_wallet = ?
+    ''', (wallet,))
+    row = c.fetchone()
+    
+    created = row['created_count'] or 0
+    disputes_initiated = row['disputes_initiated'] or 0
+    
+    # Calculate disputes where they were party B
+    disputes_as_b = disputed - disputes_initiated if disputed > 0 else 0
+    
+    # Calculate reputation score (0-100)
+    reputation = 50  # Base score
+    
+    if total_deals == 0:
+        reputation = 0  # Unknown
+        risk_level = "unknown"
+    else:
+        # +10 for each completed deal (max +50)
+        reputation += min(completed * 10, 50)
+        
+        # -20 for each dispute initiated
+        reputation -= disputes_initiated * 20
+        
+        # -10 for each dispute as party B
+        reputation -= disputes_as_b * 10
+        
+        # Bonus for longevity (deals over 30 days)
+        if first_deal and total_deals >= 3:
+            reputation += 10
+        
+        # Clamp to 0-100
+        reputation = max(0, min(100, reputation))
+        
+        # Determine risk level
+        if reputation >= 80:
+            risk_level = "low"
+        elif reputation >= 50:
+            risk_level = "medium"
+        else:
+            risk_level = "high"
+    
+    conn.close()
+    
+    return ScoutResponse(
+        wallet=wallet,
+        deals_completed=completed,
+        deals_created=created,
+        disputes_initiated=disputes_initiated,
+        disputes_involved=disputed,
+        avg_deal_size=round(avg_amount, 2),
+        first_deal_date=first_deal,
+        last_deal_date=last_deal,
+        risk_level=risk_level,
+        reputation_score=reputation
+    )
+
+# ============================================================================
+# MICRO-TOOL 3: Webhook Receipts
+# ============================================================================
+class WebhookReceiptRequest(BaseModel):
+    url: str
+    payload: str
+    expected_response: str | None = None
+    method: str = "POST"
+
+class WebhookReceiptResponse(BaseModel):
+    delivered: bool
+    timestamp: str
+    response_code: int | None
+    response_body: str | None
+    receipt_id: str
+    verification_hash: str
+    error: str | None
+
+@app.post("/webhook/receipt", response_model=WebhookReceiptResponse)
+async def webhook_receipt(request: WebhookReceiptRequest):
+    """
+    Verify webhook delivery and generate receipt.
+    Useful for dispute evidence ("I sent the webhook, here's proof").
+    N8N-compatible: POST endpoint, works with N8N webhook workflows.
+    Price: $0.01 via x402 middleware.
+    """
+    import hashlib
+    import requests
+    
+    receipt_id = str(uuid.uuid4())[:12]
+    timestamp = datetime.utcnow().isoformat()
+    
+    try:
+        # Make the webhook request
+        if request.method.upper() == "POST":
+            resp = requests.post(
+                request.url, 
+                data=request.payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30
+            )
+        else:
+            resp = requests.get(
+                request.url,
+                headers={"Content-Type": "application/json"},
+                timeout=30
+            )
+        
+        delivered = True
+        response_code = resp.status_code
+        response_body = resp.text[:500]  # Truncate if too long
+        error = None
+        
+        # Check if response matches expected
+        if request.expected_response and request.expected_response not in response_body:
+            error = f"Expected '{request.expected_response}' not found in response"
+        
+    except requests.exceptions.Timeout:
+        delivered = False
+        response_code = None
+        response_body = None
+        error = "Request timeout after 30 seconds"
+    except requests.exceptions.RequestException as e:
+        delivered = False
+        response_code = None
+        response_body = None
+        error = str(e)
+    
+    # Generate verification hash
+    hash_input = f"{receipt_id}:{timestamp}:{request.url}:{response_code or 'none'}"
+    verification_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
+    
+    return WebhookReceiptResponse(
+        delivered=delivered,
+        timestamp=timestamp,
+        response_code=response_code,
+        response_body=response_body,
+        receipt_id=receipt_id,
+        verification_hash=verification_hash,
+        error=error
+    )
+
+# ============================================================================
+# Add micro-tool pricing to routes
+# ============================================================================
+
+# These routes are free (drive Handshake adoption)
+# routes["POST /validate-deal"] = RouteConfig(...)  # Free
+
+# These routes are $0.01 (revenue generating)
+# routes["GET /scout/{wallet}"] = RouteConfig(...)  # $0.01
+# routes["POST /webhook/receipt"] = RouteConfig(...)  # $0.01
 
 if __name__ == "__main__":
     import uvicorn

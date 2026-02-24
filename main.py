@@ -84,10 +84,112 @@ def init_db():
         )
     ''')
     
+    # Reputation table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS reputation (
+            wallet_address TEXT PRIMARY KEY,
+            agent_name TEXT,
+            moltbook_handle TEXT,
+            deals_created INTEGER DEFAULT 0,
+            deals_joined INTEGER DEFAULT 0,
+            deals_completed INTEGER DEFAULT 0,
+            deals_disputed INTEGER DEFAULT 0,
+            deals_won INTEGER DEFAULT 0,
+            deals_lost INTEGER DEFAULT 0,
+            total_volume_usd REAL DEFAULT 0,
+            first_deal_at TIMESTAMP,
+            last_deal_at TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
 init_db()
+
+# ============================================================================
+# REPUTATION SYSTEM
+# ============================================================================
+
+def get_db():
+    """Get database connection."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def get_or_create_reputation(wallet_address: str, agent_name: str = None, moltbook_handle: str = None):
+    """Get existing reputation or create new entry."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM reputation WHERE wallet_address = ?', (wallet_address,))
+    row = c.fetchone()
+    if not row:
+        now = datetime.utcnow().isoformat()
+        c.execute('''
+            INSERT INTO reputation (wallet_address, agent_name, moltbook_handle, first_deal_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (wallet_address, agent_name, moltbook_handle, now, now))
+        conn.commit()
+        c.execute('SELECT * FROM reputation WHERE wallet_address = ?', (wallet_address,))
+        row = c.fetchone()
+    conn.close()
+    return dict(row)
+
+def update_reputation(wallet_address: str, field: str, increment: int = 1, volume: float = 0):
+    """Update a reputation field for a wallet."""
+    if field not in ['deals_created', 'deals_joined', 'deals_completed', 'deals_disputed', 'deals_won', 'deals_lost']:
+        return
+    conn = get_db()
+    c = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    c.execute(f'''
+        UPDATE reputation 
+        SET {field} = {field} + ?, 
+            total_volume_usd = total_volume_usd + ?, 
+            last_deal_at = ?, 
+            updated_at = ?
+        WHERE wallet_address = ?
+    ''', (increment, volume, now, now, wallet_address))
+    conn.commit()
+    conn.close()
+
+def get_trust_tier(score: int) -> str:
+    """Get trust tier based on score."""
+    if score >= 500:
+        return "🏆 Elite"
+    if score >= 200:
+        return "⭐ Trusted"
+    if score >= 50:
+        return "✓ Verified"
+    if score >= 10:
+        return "🌱 New"
+    return "❓ Unknown"
+
+def calculate_reputation_score(rep: dict) -> dict:
+    """Calculate derived reputation metrics."""
+    total_deals = rep['deals_completed'] + rep['deals_disputed']
+    if total_deals == 0:
+        success_rate = None
+        trust_score = 0
+    else:
+        success_rate = round((rep['deals_completed'] / total_deals) * 100, 1)
+        # Trust score formula
+        trust_score = (
+            rep['deals_completed'] * 10 +
+            rep['deals_won'] * 5 -
+            rep['deals_disputed'] * 20 -
+            rep['deals_lost'] * 30
+        )
+        trust_score = max(0, trust_score)  # Floor at 0
+    
+    return {
+        **rep,
+        'success_rate': success_rate,
+        'trust_score': trust_score,
+        'total_deals': total_deals,
+        'tier': get_trust_tier(trust_score)
+    }
 
 # ============================================================================
 # ROUTE CONFIGS FOR X402 PAYMENTS
@@ -182,6 +284,24 @@ class HistoryResponse(BaseModel):
     changed_at: str
     notes: str | None
 
+class ReputationResponse(BaseModel):
+    wallet_address: str
+    agent_name: str | None
+    moltbook_handle: str | None
+    deals_created: int
+    deals_joined: int
+    deals_completed: int
+    deals_disputed: int
+    deals_won: int
+    deals_lost: int
+    total_deals: int
+    total_volume_usd: float
+    success_rate: float | None
+    trust_score: int
+    tier: str
+    first_deal_at: str | None
+    last_deal_at: str | None
+
 # ============================================================================
 # HELPERS
 # ============================================================================
@@ -220,8 +340,8 @@ def check_is_expired(expires_at: str | None, status: str) -> bool:
 async def root():
     return {
         "name": "Handshake MVP",
-        "version": "2.1.0",
-        "description": "Off-chain deal escrow with x402 payments",
+        "version": "2.2.0",
+        "description": "Off-chain deal escrow with x402 payments + reputation tracking",
         "price": "$1.00 per deal ($0.50 per party)",
         "receiver": RECEIVER_ADDRESS,
         "network": "Base Mainnet" if "8453" in NETWORK else "Base Sepolia",
@@ -235,6 +355,11 @@ async def root():
             "GET /handshake/{id}/evidence",
             "GET /handshake/{id}/history",
             "GET /handshake/{id}",
+        ],
+        "reputation_endpoints": [
+            "GET /reputation/{wallet} - Get agent reputation",
+            "GET /reputation - Leaderboard (top 20)",
+            "POST /reputation/{wallet}/resolve - Admin: resolve dispute"
         ]
     }
 
@@ -245,7 +370,19 @@ async def get_faq():
         "time_windows": "Optional deadline_hours on create. is_expired flag shows if deadline passed. Auto-dispute coming v2.",
         "partial_completion": "Binary in v1. Milestone releases planned v2.",
         "multi_party": "Two-party only. 3+ party if demand.",
-        "reputation": "Considering MoltID/ERC-8004 for v2.",
+        "reputation": {
+            "how_it_works": "Every Handshake deal updates your reputation automatically.",
+            "trust_score": "Based on completed deals (+10), wins (+5), disputes (-20), losses (-30).",
+            "tiers": {
+                "🏆 Elite": "500+ trust score",
+                "⭐ Trusted": "200+ trust score",
+                "✓ Verified": "50+ trust score",
+                "🌱 New": "10+ trust score",
+                "❓ Unknown": "No deals yet"
+            },
+            "success_rate": "deals_completed / (deals_completed + deals_disputed) * 100",
+            "endpoints": "GET /reputation/{wallet} for any agent's reputation. GET /reputation for leaderboard."
+        },
         "evidence_submission": "POST /handshake/{id}/evidence with submitted_by, evidence_type, content.",
         "deal_flow": [
             "1. POST /handshake/create (terms + $0.50) → deal_id",
@@ -285,6 +422,10 @@ async def handshake_create(request: CreateDealRequest):
     # Log status change
     log_status_change(deal_id, None, 'pending_b', request.party_a_wallet, 'Deal created')
     
+    # Update reputation for Party A
+    get_or_create_reputation(request.party_a_wallet)
+    update_reputation(request.party_a_wallet, 'deals_created', volume=request.deal_amount)
+    
     deadline_msg = f" Deadline: {request.deadline_hours}h." if request.deadline_hours else ""
     
     return CreateDealResponse(
@@ -321,6 +462,10 @@ async def handshake_join(deal_id: str):
     
     # Log status change
     log_status_change(deal_id, 'pending_b', 'active', deal['party_b_wallet'], 'Party B joined')
+    
+    # Update reputation for Party B
+    get_or_create_reputation(deal['party_b_wallet'])
+    update_reputation(deal['party_b_wallet'], 'deals_joined', volume=deal['deal_amount'])
     
     return JoinDealResponse(
         deal_id=deal_id,
@@ -413,6 +558,9 @@ async def handshake_complete(deal_id: str, request: Request):
         final_status = "completed"
         # Log completion
         log_status_change(deal_id, old_status, 'completed', caller_wallet, 'Both parties completed')
+        # Update reputation for both parties
+        update_reputation(deal['party_a_wallet'], 'deals_completed', volume=deal['deal_amount'])
+        update_reputation(deal['party_b_wallet'], 'deals_completed', volume=deal['deal_amount'])
     else:
         c.execute('UPDATE deals SET status = ?, updated_at = ? WHERE deal_id = ?',
                   ('pending_completion', now, deal_id))
@@ -472,6 +620,9 @@ async def handshake_dispute(deal_id: str, request: Request):
     
     # Log dispute
     log_status_change(deal_id, old_status, 'disputed', caller_wallet, f'Reason: {reason}')
+    
+    # Update reputation for caller (they opened dispute)
+    update_reputation(caller_wallet, 'deals_disputed')
     
     print(f"[DISPUTE] Deal {deal_id} by {caller_wallet}")
     print(f"[DISPUTE] Reason: {reason}")
@@ -880,6 +1031,75 @@ async def webhook_receipt(request: WebhookReceiptRequest):
         verification_hash=verification_hash,
         error=error
     )
+
+# ============================================================================
+# REPUTATION API ENDPOINTS
+# ============================================================================
+
+@app.get("/reputation/{wallet_address}", response_model=ReputationResponse)
+async def get_reputation(wallet_address: str):
+    """Get agent reputation by wallet address."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM reputation WHERE wallet_address = ?', (wallet_address,))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        # Return empty reputation for unknown wallet
+        return ReputationResponse(
+            wallet_address=wallet_address,
+            agent_name=None,
+            moltbook_handle=None,
+            deals_created=0,
+            deals_joined=0,
+            deals_completed=0,
+            deals_disputed=0,
+            deals_won=0,
+            deals_lost=0,
+            total_deals=0,
+            total_volume_usd=0,
+            success_rate=None,
+            trust_score=0,
+            tier="❓ Unknown",
+            first_deal_at=None,
+            last_deal_at=None
+        )
+    
+    rep = calculate_reputation_score(dict(row))
+    return ReputationResponse(**rep)
+
+@app.get("/reputation")
+async def get_leaderboard(limit: int = 20):
+    """Get top agents by completed deals."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''
+        SELECT * FROM reputation 
+        WHERE deals_completed > 0 
+        ORDER BY deals_completed DESC, deals_disputed ASC 
+        LIMIT ?
+    ''', (limit,))
+    rows = c.fetchall()
+    conn.close()
+    
+    return {
+        "leaderboard": [calculate_reputation_score(dict(row)) for row in rows],
+        "total_agents": len(rows)
+    }
+
+@app.post("/reputation/{wallet_address}/resolve")
+async def resolve_dispute(wallet_address: str, request: Request):
+    """Admin endpoint: Record dispute resolution (winner/loser)."""
+    body = await request.json()
+    won = body.get('won', False)
+    
+    if won:
+        update_reputation(wallet_address, 'deals_won')
+    else:
+        update_reputation(wallet_address, 'deals_lost')
+    
+    return {"message": f"Dispute resolved. Agent {'won' if won else 'lost'}."}
 
 # ============================================================================
 # Add micro-tool pricing to routes

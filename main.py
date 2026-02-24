@@ -1121,35 +1121,103 @@ class DirectorySubmission(BaseModel):
     api_url: str | None = None
     wallet_address: str | None = None
 
-# Store pending submissions (approve later)
-PENDING_FILE = "pending_agents.json"
+# Store pending submissions in SQLite (Render has read-only filesystem)
+def init_pending_table():
+    """Initialize pending_agents table."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS pending_agents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            tagline TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT NOT NULL,
+            services TEXT NOT NULL,
+            pricing TEXT NOT NULL,
+            moltbook TEXT NOT NULL UNIQUE,
+            api_url TEXT,
+            wallet_address TEXT,
+            submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'pending'
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_pending_table()
 
 def load_pending():
-    if os.path.exists(PENDING_FILE):
-        with open(PENDING_FILE, 'r') as f:
-            return json.load(f)
-    return {"pending": []}
+    """Load all pending agents from database."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM pending_agents WHERE status = ?', ('pending',))
+    rows = c.fetchall()
+    conn.close()
+    
+    pending = []
+    for row in rows:
+        agent = dict(row)
+        # Convert services from JSON string to list
+        try:
+            agent['services'] = json.loads(agent['services'])
+        except:
+            agent['services'] = agent['services'].split(',') if agent['services'] else []
+        pending.append(agent)
+    
+    return {"pending": pending}
 
-def save_pending(data):
-    with open(PENDING_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+def save_pending_agent(agent_data):
+    """Save a new pending agent to database."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO pending_agents (name, tagline, description, category, services, pricing, moltbook, api_url, wallet_address, submitted_at, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        agent_data['name'],
+        agent_data['tagline'],
+        agent_data['description'],
+        agent_data['category'],
+        json.dumps(agent_data['services']),
+        agent_data['pricing'],
+        agent_data['moltbook'],
+        agent_data.get('api_url'),
+        agent_data.get('wallet_address'),
+        agent_data['submitted_at'],
+        agent_data['status']
+    ))
+    conn.commit()
+    conn.close()
+
+def remove_pending_agent(moltbook_handle):
+    """Remove agent from pending queue."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('DELETE FROM pending_agents WHERE moltbook = ?', (moltbook_handle,))
+    conn.commit()
+    conn.close()
 
 @app.post("/directory/submit")
 async def submit_to_directory(submission: DirectorySubmission):
     """Submit agent to directory for approval"""
-    data = load_pending()
-    
     # Check for duplicates
-    for agent in data['pending']:
-        if agent['moltbook'].lower() == submission.moltbook.lower():
-            return {"status": "already_pending", "message": f"{submission.name} is already in the approval queue"}
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT id FROM pending_agents WHERE moltbook = ?', (submission.moltbook,))
+    if c.fetchone():
+        conn.close()
+        return {"status": "already_pending", "message": f"{submission.name} is already in the approval queue"}
+    conn.close()
     
     # Add to pending
     entry = submission.dict()
     entry['submitted_at'] = datetime.now(timezone.utc).isoformat()
     entry['status'] = 'pending'
-    data['pending'].append(entry)
-    save_pending(data)
+    save_pending_agent(entry)
+    
+    # Get queue position
+    data = load_pending()
     
     return {
         "status": "submitted",
@@ -1165,12 +1233,10 @@ async def get_pending():
 @app.post("/directory/approve/{moltbook_handle}")
 async def approve_agent(moltbook_handle: str):
     """Approve agent and add to directory (admin only)"""
-    # Load pending
-    pending_data = load_pending()
-    
-    # Find agent
+    # Load pending and find agent
+    data = load_pending()
     agent = None
-    for a in pending_data['pending']:
+    for a in data['pending']:
         if a['moltbook'].lower() == moltbook_handle.lower().replace('@', ''):
             agent = a
             break
@@ -1179,8 +1245,7 @@ async def approve_agent(moltbook_handle: str):
         return {"error": "Agent not found in pending queue"}
     
     # Remove from pending
-    pending_data['pending'] = [a for a in pending_data['pending'] if a['moltbook'].lower() != moltbook_handle.lower().replace('@', '')]
-    save_pending(pending_data)
+    remove_pending_agent(agent['moltbook'])
     
     return {
         "status": "approved",

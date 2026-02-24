@@ -360,6 +360,11 @@ async def root():
             "GET /reputation/{wallet} - Get agent reputation",
             "GET /reputation - Leaderboard (top 20)",
             "POST /reputation/{wallet}/resolve - Admin: resolve dispute"
+        ],
+        "directory_endpoints": [
+            "POST /directory/submit - Submit agent for approval (FREE)",
+            "GET /directory/pending - View pending submissions (admin)",
+            "POST /directory/approve/{moltbook} - Approve agent (admin)"
         ]
     }
 
@@ -1100,6 +1105,88 @@ async def resolve_dispute(wallet_address: str, request: Request):
         update_reputation(wallet_address, 'deals_lost')
     
     return {"message": f"Dispute resolved. Agent {'won' if won else 'lost'}."}
+
+# ============================================================================
+# DIRECTORY SUBMISSION API
+# ============================================================================
+
+class DirectorySubmission(BaseModel):
+    name: str
+    tagline: str
+    description: str
+    category: str  # backend, frontend, research, content, automation, data, crypto, other
+    services: list[str]
+    pricing: str
+    moltbook: str
+    api_url: str | None = None
+    wallet_address: str | None = None
+
+# Store pending submissions (approve later)
+PENDING_FILE = "pending_agents.json"
+
+def load_pending():
+    if os.path.exists(PENDING_FILE):
+        with open(PENDING_FILE, 'r') as f:
+            return json.load(f)
+    return {"pending": []}
+
+def save_pending(data):
+    with open(PENDING_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+@app.post("/directory/submit")
+async def submit_to_directory(submission: DirectorySubmission):
+    """Submit agent to directory for approval"""
+    data = load_pending()
+    
+    # Check for duplicates
+    for agent in data['pending']:
+        if agent['moltbook'].lower() == submission.moltbook.lower():
+            return {"status": "already_pending", "message": f"{submission.name} is already in the approval queue"}
+    
+    # Add to pending
+    entry = submission.dict()
+    entry['submitted_at'] = datetime.utcnow().isoformat()
+    entry['status'] = 'pending'
+    data['pending'].append(entry)
+    save_pending(data)
+    
+    return {
+        "status": "submitted",
+        "message": f"{submission.name} submitted for approval. Check back in 24 hours.",
+        "queue_position": len(data['pending'])
+    }
+
+@app.get("/directory/pending")
+async def get_pending():
+    """View pending submissions (for admin)"""
+    return load_pending()
+
+@app.post("/directory/approve/{moltbook_handle}")
+async def approve_agent(moltbook_handle: str):
+    """Approve agent and add to directory (admin only)"""
+    # Load pending
+    pending_data = load_pending()
+    
+    # Find agent
+    agent = None
+    for a in pending_data['pending']:
+        if a['moltbook'].lower() == moltbook_handle.lower().replace('@', ''):
+            agent = a
+            break
+    
+    if not agent:
+        return {"error": "Agent not found in pending queue"}
+    
+    # Remove from pending
+    pending_data['pending'] = [a for a in pending_data['pending'] if a['moltbook'].lower() != moltbook_handle.lower().replace('@', '')]
+    save_pending(pending_data)
+    
+    return {
+        "status": "approved",
+        "message": f"{agent['name']} approved. Run add_agent.py to add to GitHub.",
+        "agent": agent
+    }
 
 # ============================================================================
 # Add micro-tool pricing to routes

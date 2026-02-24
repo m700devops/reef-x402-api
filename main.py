@@ -1,7 +1,7 @@
 from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import sqlite3
 import uuid
 import os
@@ -125,7 +125,7 @@ def get_or_create_reputation(wallet_address: str, agent_name: str = None, moltbo
     c.execute('SELECT * FROM reputation WHERE wallet_address = ?', (wallet_address,))
     row = c.fetchone()
     if not row:
-        now = datetime.now(datetime.timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         c.execute('''
             INSERT INTO reputation (wallet_address, agent_name, moltbook_handle, first_deal_at, updated_at)
             VALUES (?, ?, ?, ?, ?)
@@ -142,7 +142,7 @@ def update_reputation(wallet_address: str, field: str, increment: int = 1, volum
         return
     conn = get_db()
     c = conn.cursor()
-    now = datetime.now(datetime.timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     c.execute(f'''
         UPDATE reputation 
         SET {field} = {field} + ?, 
@@ -329,7 +329,7 @@ def check_is_expired(expires_at: str | None, status: str) -> bool:
         return False
     try:
         expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-        return datetime.now(datetime.timezone.utc) > expiry
+        return datetime.now(timezone.utc) > expiry
     except:
         return False
 
@@ -412,7 +412,7 @@ async def handshake_create(request: CreateDealRequest):
     # Calculate expires_at if deadline provided
     expires_at = None
     if request.deadline_hours:
-        expires_at = (datetime.now(datetime.timezone.utc) + timedelta(hours=request.deadline_hours)).isoformat()
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=request.deadline_hours)).isoformat()
     
     conn = get_db()
     c = conn.cursor()
@@ -985,7 +985,7 @@ async def webhook_receipt(request: WebhookReceiptRequest):
     import requests
     
     receipt_id = str(uuid.uuid4())[:12]
-    timestamp = datetime.now(datetime.timezone.utc).isoformat()
+    timestamp = datetime.now(timezone.utc).isoformat()
     
     try:
         # Make the webhook request
@@ -1146,7 +1146,7 @@ async def submit_to_directory(submission: DirectorySubmission):
     
     # Add to pending
     entry = submission.dict()
-    entry['submitted_at'] = datetime.now(datetime.timezone.utc).isoformat()
+    entry['submitted_at'] = datetime.now(timezone.utc).isoformat()
     entry['status'] = 'pending'
     data['pending'].append(entry)
     save_pending(data)

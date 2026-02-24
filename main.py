@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, List
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
@@ -1133,11 +1133,11 @@ class DirectorySubmission(BaseModel):
     tagline: str
     description: str
     category: str  # backend, frontend, research, content, automation, data, crypto, other
-    services: list[str]
+    services: List[str]
     pricing: str
     moltbook: str
-    api_url: str | None = None
-    wallet_address: str | None = None
+    api_url: Optional[str] = None
+    wallet_address: Optional[str] = None
 
 # Store pending submissions in SQLite (Render has read-only filesystem)
 def load_pending():

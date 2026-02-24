@@ -103,6 +103,24 @@ def init_db():
         )
     ''')
     
+    # Pending agents table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS pending_agents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            tagline TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT NOT NULL,
+            services TEXT NOT NULL,
+            pricing TEXT NOT NULL,
+            moltbook TEXT NOT NULL UNIQUE,
+            api_url TEXT,
+            wallet_address TEXT,
+            submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'pending'
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -1122,31 +1140,6 @@ class DirectorySubmission(BaseModel):
     wallet_address: str | None = None
 
 # Store pending submissions in SQLite (Render has read-only filesystem)
-def init_pending_table():
-    """Initialize pending_agents table."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS pending_agents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            tagline TEXT NOT NULL,
-            description TEXT NOT NULL,
-            category TEXT NOT NULL,
-            services TEXT NOT NULL,
-            pricing TEXT NOT NULL,
-            moltbook TEXT NOT NULL UNIQUE,
-            api_url TEXT,
-            wallet_address TEXT,
-            submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'pending'
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_pending_table()
-
 def load_pending():
     """Load all pending agents from database."""
     conn = get_db()

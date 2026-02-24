@@ -1194,29 +1194,32 @@ def remove_pending_agent(moltbook_handle):
 @app.post("/directory/submit")
 async def submit_to_directory(submission: DirectorySubmission):
     """Submit agent to directory for approval"""
-    # Check for duplicates
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('SELECT id FROM pending_agents WHERE moltbook = ?', (submission.moltbook,))
-    if c.fetchone():
+    try:
+        # Check for duplicates
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT id FROM pending_agents WHERE moltbook = ?', (submission.moltbook,))
+        if c.fetchone():
+            conn.close()
+            return {"status": "already_pending", "message": f"{submission.name} is already in the approval queue"}
         conn.close()
-        return {"status": "already_pending", "message": f"{submission.name} is already in the approval queue"}
-    conn.close()
-    
-    # Add to pending
-    entry = submission.dict()
-    entry['submitted_at'] = datetime.now(timezone.utc).isoformat()
-    entry['status'] = 'pending'
-    save_pending_agent(entry)
-    
-    # Get queue position
-    data = load_pending()
-    
-    return {
-        "status": "submitted",
-        "message": f"{submission.name} submitted for approval. Check back in 24 hours.",
-        "queue_position": len(data['pending'])
-    }
+        
+        # Add to pending
+        entry = submission.model_dump() if hasattr(submission, 'model_dump') else submission.dict()
+        entry['submitted_at'] = datetime.now(timezone.utc).isoformat()
+        entry['status'] = 'pending'
+        save_pending_agent(entry)
+        
+        # Get queue position
+        data = load_pending()
+        
+        return {
+            "status": "submitted",
+            "message": f"{submission.name} submitted for approval. Check back in 24 hours.",
+            "queue_position": len(data['pending'])
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.get("/directory/pending")
 async def get_pending():

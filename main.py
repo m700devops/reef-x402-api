@@ -122,6 +122,38 @@ def init_db():
         )
     ''')
     
+    # Claims table for TruthScore
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS claims (
+            id TEXT PRIMARY KEY,
+            agent_wallet TEXT,
+            agent_handle TEXT,
+            claim_type TEXT,
+            claim_text TEXT,
+            claim_value TEXT,
+            source_url TEXT,
+            status TEXT DEFAULT 'unverified',
+            verified_at TIMESTAMP,
+            evidence TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Truth reports table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS truth_reports (
+            id TEXT PRIMARY KEY,
+            reporter_wallet TEXT,
+            target_wallet TEXT,
+            target_handle TEXT,
+            claim_text TEXT,
+            evidence TEXT,
+            status TEXT DEFAULT 'pending',
+            resolution TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -211,6 +243,156 @@ def calculate_reputation_score(rep: dict) -> dict:
     }
 
 # ============================================================================
+# TRUTHSCORE SYSTEM
+# ============================================================================
+
+import httpx
+
+def calculate_truthscore(wallet_address: str) -> dict:
+    """Calculate TruthScore based on Handshake history + verified claims"""
+    conn = get_db()
+    c = conn.cursor()
+    
+    # Get reputation data
+    c.execute('SELECT * FROM reputation WHERE wallet_address = ?', (wallet_address,))
+    rep_row = c.fetchone()
+    
+    # Get claims data
+    c.execute('SELECT status, COUNT(*) as count FROM claims WHERE agent_wallet = ? GROUP BY status', (wallet_address,))
+    claims_rows = c.fetchall()
+    
+    # Get reports against this agent
+    c.execute('SELECT COUNT(*) FROM truth_reports WHERE target_wallet = ? AND status = "confirmed"', (wallet_address,))
+    confirmed_lies = c.fetchone()[0]
+    
+    conn.close()
+    
+    # Parse claims
+    claims_verified = 0
+    claims_false = 0
+    claims_unverified = 0
+    for row in claims_rows:
+        if row['status'] == 'verified':
+            claims_verified += row['count']
+        elif row['status'] == 'false':
+            claims_false += row['count']
+        else:
+            claims_unverified += row['count']
+    
+    # Get reputation data
+    if rep_row:
+        rep = dict(rep_row)
+        deals_completed = rep.get('deals_completed', 0)
+        deals_disputed = rep.get('deals_disputed', 0)
+        disputes_won = rep.get('deals_won', 0)
+        disputes_lost = rep.get('deals_lost', 0)
+    else:
+        deals_completed = 0
+        deals_disputed = 0
+        disputes_won = 0
+        disputes_lost = 0
+    
+    # TruthScore formula
+    score = 50
+    score += min(deals_completed * 2, 40)
+    score += min(claims_verified * 5, 30)
+    score -= disputes_lost * 10
+    score -= confirmed_lies * 20
+    score -= claims_false * 5
+    
+    # Clamp to 0-100
+    score = max(0, min(100, score))
+    
+    # Determine tier
+    if score >= 90:
+        tier = "✅💎 Verified Honest"
+    elif score >= 75:
+        tier = "✅ Trustworthy"
+    elif score >= 50:
+        tier = "⚠️ Mixed Record"
+    elif score >= 25:
+        tier = "🚩 Unreliable"
+    else:
+        tier = "❌ Known Liar"
+    
+    return {
+        "wallet_address": wallet_address,
+        "truthscore": score,
+        "tier": tier,
+        "deals_completed": deals_completed,
+        "deals_disputed": deals_disputed,
+        "disputes_won": disputes_won,
+        "disputes_lost": disputes_lost,
+        "claims_verified": claims_verified,
+        "claims_false": claims_false,
+        "claims_unverified": claims_unverified,
+        "confirmed_lies": confirmed_lies,
+        "has_handshake_history": deals_completed > 0
+    }
+
+async def verify_api_claim(url: str) -> dict:
+    """Verify an API exists and responds"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(url)
+            return {
+                "verified": response.status_code < 500,
+                "status_code": response.status_code,
+                "evidence": f"HTTP {response.status_code} at {datetime.now(timezone.utc).isoformat()}"
+            }
+    except Exception as e:
+        return {
+            "verified": False,
+            "status_code": None,
+            "evidence": f"Failed to reach: {str(e)}"
+        }
+
+def verify_deal_count_claim(wallet_address: str, claimed_count: int) -> dict:
+    """Verify deal count against Handshake records"""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT deals_completed FROM reputation WHERE wallet_address = ?', (wallet_address,))
+    row = c.fetchone()
+    conn.close()
+    
+    actual_count = row['deals_completed'] if row else 0
+    is_accurate = actual_count >= claimed_count * 0.9
+    
+    return {
+        "verified": is_accurate,
+        "claimed": claimed_count,
+        "actual": actual_count,
+        "evidence": f"Handshake records show {actual_count} completed deals"
+    }
+
+def verify_success_rate_claim(wallet_address: str, claimed_rate: float) -> dict:
+    """Verify success rate against Handshake records"""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT deals_completed, deals_disputed FROM reputation WHERE wallet_address = ?', (wallet_address,))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row or (row['deals_completed'] + row['deals_disputed']) == 0:
+        return {
+            "verified": False,
+            "claimed": claimed_rate,
+            "actual": None,
+            "evidence": "No deal history found"
+        }
+    
+    total = row['deals_completed'] + row['deals_disputed']
+    actual_rate = (row['deals_completed'] / total) * 100
+    is_accurate = abs(actual_rate - claimed_rate) <= 5
+    
+    return {
+        "verified": is_accurate,
+        "claimed": claimed_rate,
+        "actual": round(actual_rate, 1),
+        "evidence": f"Calculated from {total} total deals"
+    }
+
+# ============================================================================
 # ROUTE CONFIGS FOR X402 PAYMENTS
 # ============================================================================
 routes: dict[str, RouteConfig] = {
@@ -297,6 +479,22 @@ class EvidenceResponse(BaseModel):
 class HistoryResponse(BaseModel):
     id: int
     deal_id: str
+
+# ============================================================================
+# TRUTHSCORE MODELS
+# ============================================================================
+
+class ClaimSubmission(BaseModel):
+    claim_type: str  # api_exists, deal_count, success_rate, moltbook_handle
+    claim_text: str
+    claim_value: str
+    source_url: Optional[str] = None
+
+class LieReport(BaseModel):
+    target_handle: str
+    target_wallet: Optional[str] = None
+    claim_text: str
+    evidence: str
     old_status: str | None
     new_status: str
     changed_by: str | None
@@ -1124,6 +1322,132 @@ async def resolve_dispute(wallet_address: str, request: Request):
         update_reputation(wallet_address, 'deals_lost')
     
     return {"message": f"Dispute resolved. Agent {'won' if won else 'lost'}."}
+
+# ============================================================================
+# TRUTHSCORE API ENDPOINTS
+# ============================================================================
+
+@app.get("/truthscore/{wallet_address}")
+async def get_truthscore(wallet_address: str):
+    """Get an agent's TruthScore and breakdown."""
+    return calculate_truthscore(wallet_address)
+
+@app.get("/truthscore/{wallet_address}/claims")
+async def get_agent_claims(wallet_address: str):
+    """Get all claims made by or about an agent."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM claims WHERE agent_wallet = ? ORDER BY created_at DESC', (wallet_address,))
+    rows = c.fetchall()
+    conn.close()
+    return {"claims": [dict(row) for row in rows]}
+
+@app.post("/truthscore/verify")
+async def verify_claim(wallet_address: str, claim: ClaimSubmission):
+    """Submit a claim to be verified."""
+    claim_id = str(uuid.uuid4())[:8]
+    result = None
+    status = "unverified"
+    evidence = None
+    
+    # Auto-verify based on claim type
+    if claim.claim_type == "api_exists":
+        result = await verify_api_claim(claim.claim_value)
+        status = "verified" if result["verified"] else "false"
+        evidence = result["evidence"]
+    elif claim.claim_type == "deal_count":
+        try:
+            claimed_count = int(claim.claim_value)
+            result = verify_deal_count_claim(wallet_address, claimed_count)
+            status = "verified" if result["verified"] else "false"
+            evidence = result["evidence"]
+        except:
+            status = "unverified"
+            evidence = "Could not parse claim value"
+    elif claim.claim_type == "success_rate":
+        try:
+            claimed_rate = float(claim.claim_value.replace('%', ''))
+            result = verify_success_rate_claim(wallet_address, claimed_rate)
+            status = "verified" if result["verified"] else "false"
+            evidence = result["evidence"]
+        except:
+            status = "unverified"
+            evidence = "Could not parse claim value"
+    
+    # Store claim
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO claims (id, agent_wallet, claim_type, claim_text, claim_value, source_url, status, evidence, verified_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (claim_id, wallet_address, claim.claim_type, claim.claim_text, claim.claim_value, claim.source_url, status, evidence, datetime.now(timezone.utc).isoformat() if status != "unverified" else None))
+    conn.commit()
+    conn.close()
+    
+    return {
+        "claim_id": claim_id,
+        "status": status,
+        "evidence": evidence,
+        "result": result
+    }
+
+@app.post("/truthscore/report")
+async def report_lie(report: LieReport):
+    """Report an agent for making false claims."""
+    report_id = str(uuid.uuid4())[:8]
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO truth_reports (id, target_wallet, target_handle, claim_text, evidence, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+    ''', (report_id, report.target_wallet, report.target_handle, report.claim_text, report.evidence))
+    conn.commit()
+    conn.close()
+    return {
+        "report_id": report_id,
+        "status": "pending",
+        "message": "Report submitted. Will be reviewed within 24 hours."
+    }
+
+@app.get("/truthscore/leaderboard")
+async def truthscore_leaderboard(limit: int = 20):
+    """Get leaderboard of most honest agents."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT wallet_address FROM reputation WHERE deals_completed > 0')
+    wallets = [row['wallet_address'] for row in c.fetchall()]
+    conn.close()
+    
+    scores = []
+    for wallet in wallets:
+        score_data = calculate_truthscore(wallet)
+        scores.append(score_data)
+    
+    # Sort by truthscore descending
+    scores.sort(key=lambda x: x['truthscore'], reverse=True)
+    return {
+        "leaderboard": scores[:limit],
+        "total_agents": len(scores)
+    }
+
+@app.get("/truthscore/liars")
+async def known_liars():
+    """Get list of agents with confirmed false claims."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''
+        SELECT target_wallet, target_handle, COUNT(*) as lie_count
+        FROM truth_reports
+        WHERE status = 'confirmed'
+        GROUP BY target_wallet, target_handle
+        ORDER BY lie_count DESC
+    ''')
+    rows = c.fetchall()
+    conn.close()
+    return {
+        "liars": [dict(row) for row in rows],
+        "disclaimer": "These agents have confirmed false claims. Verify independently."
+    }
 
 # ============================================================================
 # DIRECTORY SUBMISSION API

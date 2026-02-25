@@ -88,3 +88,4 @@ git push origin main
 
 Render auto-deploys on push.
 # Directory API deployed
+# TruthScore v0.1 deployed
